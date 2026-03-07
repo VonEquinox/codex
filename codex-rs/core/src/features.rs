@@ -129,6 +129,8 @@ pub enum Feature {
     Collab,
     /// Enable apps.
     Apps,
+    /// Translate reasoning summaries into Chinese via the configured translation provider.
+    ReasoningSummaryTranslation,
     /// Enable plugins.
     Plugins,
     /// Allow the model to invoke the built-in image generation tool.
@@ -652,6 +654,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::ReasoningSummaryTranslation,
+        key: "reasoning_summary_translation",
+        stage: Stage::Experimental {
+            name: "Translate reasoning summaries",
+            menu_description: "Translate streamed reasoning summaries into Chinese using the configured translation provider.",
+            announcement: "NEW: Reasoning summary translation is available in /experimental. Configure `[translation]` in config.toml, then enable it and start a new conversation.",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::Plugins,
         key: "plugins",
         stage: Stage::UnderDevelopment,
@@ -892,6 +904,28 @@ mod tests {
     fn image_generation_is_under_development() {
         assert_eq!(Feature::ImageGeneration.stage(), Stage::UnderDevelopment);
         assert_eq!(Feature::ImageGeneration.default_enabled(), false);
+    }
+
+    #[test]
+    fn reasoning_summary_translation_is_experimental_and_user_toggleable() {
+        let spec = Feature::ReasoningSummaryTranslation.info();
+        let stage = spec.stage;
+
+        assert!(matches!(stage, Stage::Experimental { .. }));
+        assert_eq!(
+            stage.experimental_menu_name(),
+            Some("Translate reasoning summaries")
+        );
+        assert_eq!(
+            stage.experimental_menu_description(),
+            Some(
+                "Translate streamed reasoning summaries into Chinese using the configured translation provider."
+            )
+        );
+        assert_eq!(
+            Feature::ReasoningSummaryTranslation.default_enabled(),
+            false
+        );
     }
 
     #[test]

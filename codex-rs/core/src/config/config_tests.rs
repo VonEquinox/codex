@@ -3028,6 +3028,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             mcp_oauth_callback_port: None,
             mcp_oauth_callback_url: None,
             model_providers: fixture.model_provider_map.clone(),
+            translation: None,
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
@@ -3163,6 +3164,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,
         model_providers: fixture.model_provider_map.clone(),
+        translation: None,
         project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
         project_doc_fallback_filenames: Vec::new(),
         tool_output_token_limit: None,
@@ -3296,6 +3298,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,
         model_providers: fixture.model_provider_map.clone(),
+        translation: None,
         project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
         project_doc_fallback_filenames: Vec::new(),
         tool_output_token_limit: None,
@@ -3415,6 +3418,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,
         model_providers: fixture.model_provider_map.clone(),
+        translation: None,
         project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
         project_doc_fallback_filenames: Vec::new(),
         tool_output_token_limit: None,
@@ -4465,6 +4469,200 @@ experimental_realtime_ws_model = "realtime-test-model"
         config.experimental_realtime_ws_model.as_deref(),
         Some("realtime-test-model")
     );
+    Ok(())
+}
+
+#[test]
+fn translation_loads_custom_provider_from_config_toml_when_feature_enabled() -> std::io::Result<()>
+{
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[features]
+reasoning_summary_translation = true
+
+[translation]
+provider = "translator"
+model = "translator-model"
+
+[model_providers.translator]
+name = "Translator"
+base_url = "https://translator.example/v1"
+wire_api = "responses"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    assert_eq!(
+        cfg.translation,
+        Some(TranslationToml {
+            provider: Some("translator".to_string()),
+            model: Some("translator-model".to_string()),
+        })
+    );
+
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    let translation = config.translation.expect("translation config should load");
+    assert_eq!(translation.provider_id, "translator");
+    assert_eq!(translation.model, "translator-model");
+    assert_eq!(
+        translation.provider.base_url.as_deref(),
+        Some("https://translator.example/v1")
+    );
+    Ok(())
+}
+
+#[test]
+fn translation_is_disabled_when_feature_is_off() -> std::io::Result<()> {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[translation]
+provider = "translator"
+model = "translator-model"
+
+[model_providers.translator]
+name = "Translator"
+base_url = "https://translator.example/v1"
+wire_api = "responses"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(config.translation, None);
+    Ok(())
+}
+
+#[test]
+fn translation_warns_when_provider_is_missing() -> std::io::Result<()> {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[features]
+reasoning_summary_translation = true
+
+[translation]
+provider = "missing"
+model = "translator-model"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(config.translation, None);
+    assert_eq!(config.startup_warnings.len(), 1);
+    assert!(
+        config.startup_warnings[0].contains("translation provider `missing` was not found"),
+        "{}",
+        config.startup_warnings[0]
+    );
+    Ok(())
+}
+
+#[test]
+fn translation_loads_builtin_provider_from_config_toml_when_feature_enabled() -> std::io::Result<()>
+{
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[features]
+reasoning_summary_translation = true
+
+[translation]
+provider = "openai"
+model = "translator-model"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    assert_eq!(
+        cfg.translation,
+        Some(TranslationToml {
+            provider: Some("openai".to_string()),
+            model: Some("translator-model".to_string()),
+        })
+    );
+
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(
+        config.translation,
+        Some(TranslationConfig {
+            provider_id: "openai".to_string(),
+            provider: built_in_model_providers()["openai"].clone(),
+            model: "translator-model".to_string(),
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn translation_missing_fields_warns_and_disables_translation() -> std::io::Result<()> {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[features]
+reasoning_summary_translation = true
+
+[translation]
+model = "translator-model"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(config.translation, None);
+    assert!(config.startup_warnings.iter().any(|warning| warning.contains(
+        "`[translation]` must set both `provider` and `model`"
+    )));
+    Ok(())
+}
+
+#[test]
+fn translation_is_ignored_when_feature_disabled() -> std::io::Result<()> {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[translation]
+provider = "openai"
+model = "translator-model"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(config.translation, None);
+    assert_eq!(config.startup_warnings, Vec::<String>::new());
     Ok(())
 }
 

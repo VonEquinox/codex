@@ -1,6 +1,10 @@
 #![cfg(not(target_os = "windows"))]
 
 use anyhow::Ok;
+use codex_core::ModelProviderInfo;
+use codex_core::built_in_model_providers;
+use codex_core::config::TranslationConfig;
+use codex_core::features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
@@ -35,6 +39,41 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
+use serde_json::json;
+use wiremock::Mock;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
+
+fn enable_reasoning_summary_translation(config: &mut codex_core::config::Config, base_url: String) {
+    let mut translation_provider: ModelProviderInfo = built_in_model_providers()["openai"].clone();
+    translation_provider.name = "Translator".to_string();
+    translation_provider.base_url = Some(format!("{base_url}/v1"));
+    translation_provider.env_key = None;
+    translation_provider.env_key_instructions = None;
+    translation_provider.experimental_bearer_token = None;
+    translation_provider.request_max_retries = Some(0);
+    translation_provider.requires_openai_auth = false;
+    translation_provider.supports_websockets = false;
+    config
+        .model_providers
+        .insert("translator".to_string(), translation_provider);
+    assert!(
+        config
+            .features
+            .enable(Feature::ReasoningSummaryTranslation)
+            .is_ok()
+    );
+    let provider = match config.model_providers.get("translator").cloned() {
+        Some(provider) => provider,
+        None => panic!("translation provider should exist"),
+    };
+    config.translation = Some(TranslationConfig {
+        provider_id: "translator".to_string(),
+        provider,
+        model: "translator-model".to_string(),
+    });
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_message_item_is_emitted() -> anyhow::Result<()> {
@@ -1057,6 +1096,160 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
     assert_eq!(delta_event.item_id, reasoning_item.id);
     assert_eq!(delta_event.delta, "step one");
     assert_eq!(legacy_delta.delta, "step one");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_summary_translation_translates_streamed_deltas_and_completed_item()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let translation_server = start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "第一步"
+                        }
+                    ]
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&translation_server)
+        .await;
+
+    let translation_base_url = translation_server.uri();
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(move |config| {
+            enable_reasoning_summary_translation(config, translation_base_url);
+        })
+        .build(&server)
+        .await?;
+
+    let stream = sse(vec![
+        ev_response_created("resp-1"),
+        ev_reasoning_item_added("reasoning-1", &[""]),
+        ev_reasoning_summary_text_delta("step one"),
+        ev_reasoning_item("reasoning-1", &["step one"], &[]),
+        ev_completed("resp-1"),
+    ]);
+    mount_sse_once(&server, stream).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "translate reasoning".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+
+    let delta_event = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ReasoningContentDelta(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    let legacy_delta = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::AgentReasoningDelta(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    let completed_item = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemCompleted(ItemCompletedEvent {
+            item: TurnItem::Reasoning(item),
+            ..
+        }) => Some(item.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(delta_event.delta, "第一步");
+    assert_eq!(legacy_delta.delta, "第一步");
+    assert_eq!(completed_item.summary_text, vec!["第一步".to_string()]);
+
+    let requests = translation_server
+        .received_requests()
+        .await
+        .unwrap_or_default();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body)?;
+    assert_eq!(body["model"], "translator-model");
+    assert_eq!(body["input"][0]["content"][0]["text"], "step one");
+    assert_eq!(
+        body["instructions"],
+        "Translate the following reasoning summary into Chinese. Preserve markdown formatting, headings, and line breaks. Return only the translated text."
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_summary_translation_falls_back_to_original_text_on_failure() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let translation_server = start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&translation_server)
+        .await;
+
+    let translation_base_url = translation_server.uri();
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(move |config| {
+            enable_reasoning_summary_translation(config, translation_base_url);
+        })
+        .build(&server)
+        .await?;
+
+    let stream = sse(vec![
+        ev_response_created("resp-1"),
+        ev_reasoning_item_added("reasoning-1", &[""]),
+        ev_reasoning_summary_text_delta("step one"),
+        ev_reasoning_item("reasoning-1", &["step one"], &[]),
+        ev_completed("resp-1"),
+    ]);
+    mount_sse_once(&server, stream).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "translate reasoning".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+
+    let delta_event = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ReasoningContentDelta(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    let completed_item = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemCompleted(ItemCompletedEvent {
+            item: TurnItem::Reasoning(item),
+            ..
+        }) => Some(item.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(delta_event.delta, "step one");
+    assert_eq!(completed_item.summary_text, vec!["step one".to_string()]);
 
     Ok(())
 }

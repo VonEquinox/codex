@@ -39,6 +39,8 @@ use crate::realtime_conversation::handle_audio as handle_realtime_conversation_a
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
+use crate::reasoning_summary_translation::PendingReasoningSummarySegment;
+use crate::reasoning_summary_translation::ReasoningSummaryTranslationState;
 use crate::rollout::session_index;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_non_tool_response_item;
@@ -85,6 +87,7 @@ use codex_protocol::items::UserMessageItem;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::format_allow_prefixes;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
@@ -6449,6 +6452,50 @@ async fn emit_agent_message_in_plan_mode(
     state.started_agent_message_items.remove(&agent_message_id);
 }
 
+async fn translate_reasoning_summary_text(
+    client_session: &ModelClientSession,
+    reasoning_summary_translation: &ReasoningSummaryTranslationState,
+    text: &str,
+) -> String {
+    let Some(config) = reasoning_summary_translation.config() else {
+        return text.to_string();
+    };
+
+    client_session
+        .translate_reasoning_summary(&config.provider, &config.model, text)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::debug!("reasoning summary translation failed: {err}");
+            text.to_string()
+        })
+}
+
+async fn emit_translated_reasoning_summary_segment(
+    sess: &Session,
+    turn_context: &TurnContext,
+    client_session: &ModelClientSession,
+    reasoning_summary_translation: &mut ReasoningSummaryTranslationState,
+    item_id: &str,
+    segment: PendingReasoningSummarySegment,
+) {
+    let translated = translate_reasoning_summary_text(
+        client_session,
+        reasoning_summary_translation,
+        &segment.text,
+    )
+    .await;
+    reasoning_summary_translation.record_translated_segment(item_id, translated.clone());
+    let event = ReasoningContentDeltaEvent {
+        thread_id: sess.conversation_id.to_string(),
+        turn_id: turn_context.sub_id.clone(),
+        item_id: item_id.to_string(),
+        delta: translated,
+        summary_index: segment.summary_index,
+    };
+    sess.send_event(turn_context, EventMsg::ReasoningContentDelta(event))
+        .await;
+}
+
 /// Emit completion for a plan-mode turn item, handling agent messages specially.
 async fn emit_turn_item_in_plan_mode(
     sess: &Session,
@@ -6581,6 +6628,8 @@ async fn try_run_sampling_request(
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
+    let mut reasoning_summary_translation =
+        ReasoningSummaryTranslationState::from_config(turn_context.config.as_ref());
     let receiving_span = trace_span!("receiving_stream");
     let outcome: CodexResult<SamplingRequestResult> = loop {
         let handle_responses = trace_span!(
@@ -6618,8 +6667,69 @@ async fn try_run_sampling_request(
 
         match event {
             ResponseEvent::Created => {}
-            ResponseEvent::OutputItemDone(item) => {
+            ResponseEvent::OutputItemDone(mut item) => {
                 let previously_active_item = active_item.take();
+                if let Some(TurnItem::Reasoning(reasoning_item)) = previously_active_item.as_ref() {
+                    if let Some(segment) =
+                        reasoning_summary_translation.finish_item(&reasoning_item.id)
+                    {
+                        emit_translated_reasoning_summary_segment(
+                            &sess,
+                            &turn_context,
+                            client_session,
+                            &mut reasoning_summary_translation,
+                            &reasoning_item.id,
+                            segment,
+                        )
+                        .await;
+                    }
+                    if let Some((reasoning_item_id, summary_texts)) = match &item {
+                        ResponseItem::Reasoning { id, summary, .. } => Some((
+                            id.clone(),
+                            summary
+                                .iter()
+                                .map(|summary_entry| match summary_entry {
+                                    ReasoningItemReasoningSummary::SummaryText { text } => {
+                                        text.clone()
+                                    }
+                                })
+                                .collect::<Vec<String>>(),
+                        )),
+                        ResponseItem::Message { .. }
+                        | ResponseItem::LocalShellCall { .. }
+                        | ResponseItem::FunctionCall { .. }
+                        | ResponseItem::FunctionCallOutput { .. }
+                        | ResponseItem::CustomToolCall { .. }
+                        | ResponseItem::CustomToolCallOutput { .. }
+                        | ResponseItem::WebSearchCall { .. }
+                        | ResponseItem::ImageGenerationCall { .. }
+                        | ResponseItem::GhostSnapshot { .. }
+                        | ResponseItem::Compaction { .. }
+                        | ResponseItem::Other => None,
+                    } {
+                        let mut translated_segments = reasoning_summary_translation
+                            .take_translated_segments(&reasoning_item_id)
+                            .unwrap_or_default();
+                        if reasoning_summary_translation.config().is_some() {
+                            for text in summary_texts.iter().skip(translated_segments.len()) {
+                                translated_segments.push(
+                                    translate_reasoning_summary_text(
+                                        client_session,
+                                        &reasoning_summary_translation,
+                                        text,
+                                    )
+                                    .await,
+                                );
+                            }
+                        }
+                        if translated_segments.len() == summary_texts.len() {
+                            let _ = ReasoningSummaryTranslationState::replace_item_summary(
+                                &mut item,
+                                translated_segments,
+                            );
+                        }
+                    }
+                }
                 if let Some(previous) = previously_active_item.as_ref()
                     && matches!(previous, TurnItem::AgentMessage(_))
                 {
@@ -6795,27 +6905,84 @@ async fn try_run_sampling_request(
                 summary_index,
             } => {
                 if let Some(active) = active_item.as_ref() {
-                    let event = ReasoningContentDeltaEvent {
-                        thread_id: sess.conversation_id.to_string(),
-                        turn_id: turn_context.sub_id.clone(),
-                        item_id: active.id(),
-                        delta,
-                        summary_index,
-                    };
-                    sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
-                        .await;
+                    if let TurnItem::Reasoning(reasoning_item) = active {
+                        if let Some(segment) = reasoning_summary_translation.push_delta(
+                            &reasoning_item.id,
+                            summary_index,
+                            &delta,
+                        ) {
+                            emit_translated_reasoning_summary_segment(
+                                &sess,
+                                &turn_context,
+                                client_session,
+                                &mut reasoning_summary_translation,
+                                &reasoning_item.id,
+                                segment,
+                            )
+                            .await;
+                            let event = EventMsg::AgentReasoningSectionBreak(
+                                AgentReasoningSectionBreakEvent {
+                                    item_id: reasoning_item.id.clone(),
+                                    summary_index,
+                                },
+                            );
+                            sess.send_event(&turn_context, event).await;
+                        } else if reasoning_summary_translation.config().is_none() {
+                            let event = ReasoningContentDeltaEvent {
+                                thread_id: sess.conversation_id.to_string(),
+                                turn_id: turn_context.sub_id.clone(),
+                                item_id: reasoning_item.id.clone(),
+                                delta,
+                                summary_index,
+                            };
+                            sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
+                                .await;
+                        }
+                    } else {
+                        let event = ReasoningContentDeltaEvent {
+                            thread_id: sess.conversation_id.to_string(),
+                            turn_id: turn_context.sub_id.clone(),
+                            item_id: active.id(),
+                            delta,
+                            summary_index,
+                        };
+                        sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
+                            .await;
+                    }
                 } else {
                     error_or_panic("ReasoningSummaryDelta without active item".to_string());
                 }
             }
             ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
                 if let Some(active) = active_item.as_ref() {
-                    let event =
-                        EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
-                            item_id: active.id(),
-                            summary_index,
-                        });
-                    sess.send_event(&turn_context, event).await;
+                    let mut should_emit_section_break = true;
+                    if let TurnItem::Reasoning(reasoning_item) = active {
+                        should_emit_section_break = false;
+                        if let Some(segment) = reasoning_summary_translation
+                            .start_new_section(&reasoning_item.id, summary_index)
+                        {
+                            emit_translated_reasoning_summary_segment(
+                                &sess,
+                                &turn_context,
+                                client_session,
+                                &mut reasoning_summary_translation,
+                                &reasoning_item.id,
+                                segment,
+                            )
+                            .await;
+                            should_emit_section_break = true;
+                        } else if reasoning_summary_translation.config().is_none() {
+                            should_emit_section_break = true;
+                        }
+                    }
+                    if should_emit_section_break {
+                        let event =
+                            EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
+                                item_id: active.id(),
+                                summary_index,
+                            });
+                        sess.send_event(&turn_context, event).await;
+                    }
                 } else {
                     error_or_panic("ReasoningSummaryPartAdded without active item".to_string());
                 }

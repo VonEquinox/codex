@@ -15,6 +15,7 @@ mod client_common;
 pub mod codex;
 mod realtime_context;
 mod realtime_conversation;
+mod reasoning_summary_translation;
 pub use codex::SteerInputError;
 mod codex_thread;
 mod compact_remote;

@@ -6870,6 +6870,14 @@ async fn experimental_features_popup_snapshot() {
             description: "Allow the model to run shell commands.".to_string(),
             enabled: true,
         },
+        ExperimentalFeatureItem {
+            feature: Feature::ReasoningSummaryTranslation,
+            name: "Translate reasoning summaries".to_string(),
+            description:
+                "Translate streamed reasoning summaries into Chinese using the configured translation provider."
+                    .to_string(),
+            enabled: false,
+        },
     ];
     let view = ExperimentalFeaturesView::new(features, chat.app_event_tx.clone());
     chat.bottom_pane.show_view(Box::new(view));

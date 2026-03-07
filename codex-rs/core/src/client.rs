@@ -34,6 +34,7 @@ use crate::api_bridge::CoreAuthProvider;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use crate::auth::UnauthorizedRecovery;
+use codex_api::AuthProvider;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::MemoriesClient as ApiMemoriesClient;
@@ -59,6 +60,8 @@ use codex_api::error::ApiError;
 use codex_api::requests::responses::Compression;
 use codex_otel::SessionTelemetry;
 
+use codex_client::HttpTransport;
+use codex_client::run_with_retry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::ServiceTier;
@@ -72,6 +75,7 @@ use eventsource_stream::EventStreamError;
 use futures::StreamExt;
 use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
+use http::Method;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
 use std::time::Duration;
@@ -97,6 +101,9 @@ use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::WireApi;
 use crate::tools::spec::create_tools_json_for_responses_api;
+use codex_protocol::models::ContentItem;
+
+const REASONING_SUMMARY_TRANSLATION_INSTRUCTIONS: &str = "Translate the following reasoning summary into Chinese. Preserve markdown formatting, headings, and line breaks. Return only the translated text.";
 
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
@@ -141,6 +148,11 @@ struct CurrentClientSetup {
     auth: Option<CodexAuth>,
     api_provider: codex_api::Provider,
     api_auth: CoreAuthProvider,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UnaryResponsesOutput {
+    output: Vec<ResponseItem>,
 }
 
 /// A session-scoped client for model-provider API calls.
@@ -397,15 +409,19 @@ impl ModelClient {
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
     async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
+        self.client_setup_for_provider(&self.state.provider).await
+    }
+
+    async fn client_setup_for_provider(
+        &self,
+        provider: &ModelProviderInfo,
+    ) -> Result<CurrentClientSetup> {
         let auth = match self.state.auth_manager.as_ref() {
             Some(manager) => manager.auth().await,
             None => None,
         };
-        let api_provider = self
-            .state
-            .provider
-            .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
-        let api_auth = auth_provider_from_auth(auth.clone(), &self.state.provider)?;
+        let api_provider = provider.to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
+        let api_auth = auth_provider_from_auth(auth.clone(), provider)?;
         Ok(CurrentClientSetup {
             auth,
             api_provider,
@@ -478,6 +494,110 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    pub(crate) async fn translate_reasoning_summary(
+        &self,
+        provider: &ModelProviderInfo,
+        model: &str,
+        text: &str,
+    ) -> Result<String> {
+        if text.trim().is_empty() {
+            return Ok(text.to_string());
+        }
+
+        let client_setup = self.client.client_setup_for_provider(provider).await?;
+        let request_body = ResponsesApiRequest {
+            model: model.to_string(),
+            instructions: REASONING_SUMMARY_TRANSLATION_INSTRUCTIONS.to_string(),
+            input: vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: text.to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }],
+            tools: Vec::new(),
+            tool_choice: "none".to_string(),
+            parallel_tool_calls: false,
+            reasoning: None,
+            store: false,
+            stream: false,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+        };
+
+        let mut request = client_setup
+            .api_provider
+            .build_request(Method::POST, "responses");
+        request.timeout = Some(Duration::from_secs(30));
+        request.headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        if let Some(token) = client_setup.api_auth.bearer_token()
+            && let Ok(header) = HeaderValue::from_str(&format!("Bearer {token}"))
+        {
+            request.headers.insert(http::header::AUTHORIZATION, header);
+        }
+        if let Some(account_id) = client_setup.api_auth.account_id()
+            && let Ok(header) = HeaderValue::from_str(&account_id)
+        {
+            request.headers.insert("ChatGPT-Account-ID", header);
+        }
+        request.body = Some(serde_json::to_value(&request_body).map_err(|err| {
+            CodexErr::Stream(format!("failed to encode translation request: {err}"), None)
+        })?);
+
+        let transport = ReqwestTransport::new(build_reqwest_client());
+        let response = run_with_retry(
+            client_setup.api_provider.retry.to_policy(),
+            || request.clone(),
+            |req, _attempt| transport.execute(req),
+        )
+        .await
+        .map_err(|err| map_api_error(ApiError::Transport(err)))?;
+
+        let parsed: UnaryResponsesOutput =
+            serde_json::from_slice(&response.body).map_err(|err| {
+                CodexErr::Stream(format!("failed to parse translation response: {err}"), None)
+            })?;
+        let translated = parsed
+            .output
+            .into_iter()
+            .filter_map(|item| match item {
+                ResponseItem::Message { role, content, .. } if role == "assistant" => Some(
+                    content
+                        .into_iter()
+                        .filter_map(|entry| match entry {
+                            ContentItem::OutputText { text } => Some(text),
+                            ContentItem::InputText { .. } | ContentItem::InputImage { .. } => None,
+                        })
+                        .collect::<String>(),
+                ),
+                ResponseItem::Message { .. }
+                | ResponseItem::Reasoning { .. }
+                | ResponseItem::LocalShellCall { .. }
+                | ResponseItem::FunctionCall { .. }
+                | ResponseItem::FunctionCallOutput { .. }
+                | ResponseItem::CustomToolCall { .. }
+                | ResponseItem::CustomToolCallOutput { .. }
+                | ResponseItem::WebSearchCall { .. }
+                | ResponseItem::ImageGenerationCall { .. }
+                | ResponseItem::GhostSnapshot { .. }
+                | ResponseItem::Compaction { .. }
+                | ResponseItem::Other => None,
+            })
+            .collect::<String>();
+        if translated.is_empty() {
+            Ok(text.to_string())
+        } else {
+            Ok(translated)
+        }
+    }
+
     fn activate_http_fallback(&self, websocket_enabled: bool) -> bool {
         websocket_enabled
             && !self

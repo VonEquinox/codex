@@ -401,6 +401,9 @@
             "realtime_conversation": {
               "type": "boolean"
             },
+            "reasoning_summary_translation": {
+              "type": "boolean"
+            },
             "remote_models": {
               "type": "boolean"
             },
@@ -1474,6 +1477,18 @@
       },
       "type": "object"
     },
+    "TranslationToml": {
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "TrustLevel": {
       "description": "Represents the trust level for a project directory. This determines the approval policy and sandbox mode applied.",
       "enum": [
@@ -1868,6 +1883,9 @@
           "type": "boolean"
         },
         "realtime_conversation": {
+          "type": "boolean"
+        },
+        "reasoning_summary_translation": {
           "type": "boolean"
         },
         "remote_models": {
@@ -2288,6 +2306,15 @@
         }
       ],
       "description": "Nested tools section for feature toggles"
+    },
+    "translation": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/TranslationToml"
+        }
+      ],
+      "default": null,
+      "description": "Optional reasoning summary translation configuration."
     },
     "tui": {
       "allOf": [

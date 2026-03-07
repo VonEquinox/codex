@@ -26,6 +26,27 @@ Codex can run a notification hook when the agent finishes a turn. See the config
 
 When Codex knows which client started the turn, the legacy notify JSON payload also includes a top-level `client` field. The TUI reports `codex-tui`, and the app server reports the `clientInfo.name` value from `initialize`.
 
+## Reasoning summary translation
+
+Codex can translate reasoning summaries into Chinese when the experimental feature is enabled and a translation provider is configured.
+
+```toml
+[features]
+reasoning_summary_translation = true
+
+[translation]
+provider = "translator"
+model = "gemini-2.5-flash-lite"
+
+[model_providers.translator]
+name = "Translator"
+base_url = "https://example.com/v1"
+env_key = "TRANSLATOR_API_KEY"
+wire_api = "responses"
+```
+
+This affects reasoning summaries only. Final assistant messages are left unchanged. If the translation request fails, Codex falls back to the original reasoning text.
+
 ## JSON Schema
 
 The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.

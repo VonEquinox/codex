@@ -358,6 +358,9 @@ pub struct Config {
     /// Combined provider map (defaults merged with user-defined overrides).
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
+    /// Optional reasoning summary translation provider/model configuration.
+    pub translation: Option<TranslationConfig>,
+
     /// Maximum number of bytes to include from an AGENTS.md project doc file.
     pub project_doc_max_bytes: usize,
 
@@ -1143,6 +1146,10 @@ pub struct ConfigToml {
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
+    /// Optional reasoning summary translation configuration.
+    #[serde(default)]
+    pub translation: Option<TranslationToml>,
+
     /// Maximum number of bytes to include from an AGENTS.md project doc file.
     pub project_doc_max_bytes: Option<usize>,
 
@@ -1379,6 +1386,20 @@ pub struct RealtimeAudioConfig {
 pub struct RealtimeAudioToml {
     pub microphone: Option<String>,
     pub speaker: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranslationConfig {
+    pub provider_id: String,
+    pub provider: ModelProviderInfo,
+    pub model: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct TranslationToml {
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
@@ -2063,6 +2084,42 @@ impl Config {
             })?
             .clone();
 
+        let translation = if features.enabled(Feature::ReasoningSummaryTranslation) {
+            match cfg.translation.clone() {
+                Some(translation_cfg) => match (translation_cfg.provider, translation_cfg.model) {
+                    (Some(provider_id), Some(model)) => match model_providers.get(&provider_id) {
+                        Some(provider) => Some(TranslationConfig {
+                            provider_id,
+                            provider: provider.clone(),
+                            model,
+                        }),
+                        None => {
+                            startup_warnings.push(format!(
+                                "Reasoning summary translation is enabled, but translation provider `{provider_id}` was not found; continuing without translation."
+                            ));
+                            None
+                        }
+                    },
+                    _ => {
+                        startup_warnings.push(
+                            "Reasoning summary translation is enabled, but `[translation]` must set both `provider` and `model`; continuing without translation."
+                                .to_string(),
+                        );
+                        None
+                    }
+                },
+                None => {
+                    startup_warnings.push(
+                        "Reasoning summary translation is enabled, but `[translation]` is not configured; continuing without translation."
+                            .to_string(),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let shell_environment_policy = cfg.shell_environment_policy.into();
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
 
@@ -2378,6 +2435,7 @@ impl Config {
             mcp_oauth_callback_port: cfg.mcp_oauth_callback_port,
             mcp_oauth_callback_url: cfg.mcp_oauth_callback_url.clone(),
             model_providers,
+            translation,
             project_doc_max_bytes: cfg.project_doc_max_bytes.unwrap_or(PROJECT_DOC_MAX_BYTES),
             project_doc_fallback_filenames: cfg
                 .project_doc_fallback_filenames
