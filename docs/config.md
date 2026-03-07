@@ -41,9 +41,11 @@ model = "gemini-2.5-flash-lite"
 [model_providers.translator]
 name = "Translator"
 base_url = "https://example.com/v1"
-env_key = "TRANSLATOR_API_KEY"
+api_key = "YOUR_TRANSLATOR_API_KEY"
 wire_api = "responses"
 ```
+
+Inline `api_key` works for custom providers, but `env_key` is still preferred for better secret hygiene.
 
 This affects reasoning summaries only. Final assistant messages are left unchanged. If the translation request fails, Codex falls back to the original reasoning text.
 

@@ -15,6 +15,6 @@ model = "gemini-2.5-flash-lite"
 [model_providers.translator]
 name = "Translator"
 base_url = "https://example.com/v1"
-env_key = "TRANSLATOR_API_KEY"
+api_key = "YOUR_TRANSLATOR_API_KEY"
 wire_api = "responses"
 ```

@@ -3354,7 +3354,12 @@ impl Session {
     ) {
         if let Some(token_usage) = token_usage {
             let mut state = self.state.lock().await;
-            state.update_token_info_from_usage(token_usage, turn_context.model_context_window());
+            state.update_token_info_from_usage(
+                token_usage,
+                turn_context.model_context_window(),
+                turn_context.model_info.context_window,
+                turn_context.model_info.auto_compact_token_limit,
+            );
         }
         self.send_token_count_event(turn_context).await;
     }
@@ -3373,6 +3378,8 @@ impl Session {
                 total_token_usage: TokenUsage::default(),
                 last_token_usage: TokenUsage::default(),
                 model_context_window: None,
+                model_full_context_window: None,
+                model_auto_compact_token_limit: None,
             });
 
             info.last_token_usage = TokenUsage {
@@ -3386,6 +3393,8 @@ impl Session {
             if let Some(model_context_window) = turn_context.model_context_window() {
                 info.model_context_window = Some(model_context_window);
             }
+            info.model_full_context_window = turn_context.model_info.context_window;
+            info.model_auto_compact_token_limit = turn_context.model_info.auto_compact_token_limit;
 
             state.set_token_info(Some(info));
         }

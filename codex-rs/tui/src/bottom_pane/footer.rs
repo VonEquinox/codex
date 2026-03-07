@@ -46,6 +46,19 @@ use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 
+const CONTEXT_BAR_SEGMENTS: usize = 6;
+const CONTEXT_BAR_FILLED: &str = "█";
+const CONTEXT_BAR_EMPTY: &str = "░";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContextWindowDisplay {
+    pub(crate) percent_remaining: Option<i64>,
+    pub(crate) fallback_used_tokens: Option<i64>,
+    pub(crate) tokens_in_window: Option<i64>,
+    pub(crate) total_tokens: Option<i64>,
+    pub(crate) auto_compact_token_limit: Option<i64>,
+}
+
 /// The rendering inputs for the footer area under the composer.
 ///
 /// Callers are expected to construct `FooterProps` from higher-level state (`ChatComposer`,
@@ -65,8 +78,7 @@ pub(crate) struct FooterProps {
     ///
     /// This is rendered when `mode` is `FooterMode::QuitShortcutReminder`.
     pub(crate) quit_shortcut_key: KeyBinding,
-    pub(crate) context_window_percent: Option<i64>,
-    pub(crate) context_window_used_tokens: Option<i64>,
+    pub(crate) context_window: ContextWindowDisplay,
     pub(crate) status_line_value: Option<Line<'static>>,
     pub(crate) status_line_enabled: bool,
 }
@@ -782,18 +794,90 @@ fn build_columns(entries: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
-pub(crate) fn context_window_line(percent: Option<i64>, used_tokens: Option<i64>) -> Line<'static> {
-    if let Some(percent) = percent {
+fn render_context_progress_bar(percent_remaining: i64) -> String {
+    let ratio = (percent_remaining.clamp(0, 100) as f64 / 100.0).clamp(0.0, 1.0);
+    let filled = (ratio * CONTEXT_BAR_SEGMENTS as f64).round() as usize;
+    let filled = filled.min(CONTEXT_BAR_SEGMENTS);
+    let empty = CONTEXT_BAR_SEGMENTS.saturating_sub(filled);
+    format!(
+        "[{}{}]",
+        CONTEXT_BAR_FILLED.repeat(filled),
+        CONTEXT_BAR_EMPTY.repeat(empty)
+    )
+}
+
+fn percent_remaining_from_tokens(remaining_tokens: i64, total_tokens: i64) -> i64 {
+    if total_tokens <= 0 {
+        return 0;
+    }
+
+    ((remaining_tokens.max(0) as f64 / total_tokens as f64) * 100.0)
+        .clamp(0.0, 100.0)
+        .round() as i64
+}
+
+pub(crate) fn context_window_summary_text(context_window: ContextWindowDisplay) -> String {
+    if let Some(tokens_in_window) = context_window.tokens_in_window {
+        if let Some(total_tokens) = context_window.total_tokens {
+            let full_remaining = total_tokens.saturating_sub(tokens_in_window).max(0);
+            let full_percent_remaining =
+                percent_remaining_from_tokens(full_remaining, total_tokens);
+            let mut summary = format!(
+                "Full {} {}",
+                render_context_progress_bar(full_percent_remaining),
+                format_tokens_compact(full_remaining)
+            );
+
+            if let Some(compact_limit) = context_window
+                .auto_compact_token_limit
+                .filter(|limit| *limit > 0)
+                .map(|limit| limit.min(total_tokens))
+            {
+                let compact_remaining = compact_limit.saturating_sub(tokens_in_window).max(0);
+                let compact_percent_remaining =
+                    percent_remaining_from_tokens(compact_remaining, compact_limit);
+                summary.push_str(&format!(
+                    " · Compact {} {}",
+                    render_context_progress_bar(compact_percent_remaining),
+                    format_tokens_compact(compact_remaining)
+                ));
+            }
+
+            return summary;
+        }
+
+        if let Some(compact_limit) = context_window
+            .auto_compact_token_limit
+            .filter(|limit| *limit > 0)
+        {
+            let compact_remaining = compact_limit.saturating_sub(tokens_in_window).max(0);
+            let compact_percent_remaining =
+                percent_remaining_from_tokens(compact_remaining, compact_limit);
+            return format!(
+                "Compact {} {}",
+                render_context_progress_bar(compact_percent_remaining),
+                format_tokens_compact(compact_remaining)
+            );
+        }
+    }
+
+    if let Some(percent) = context_window.percent_remaining {
         let percent = percent.clamp(0, 100);
-        return Line::from(vec![Span::from(format!("{percent}% context left")).dim()]);
+        return format!("{percent}% context left");
     }
 
-    if let Some(tokens) = used_tokens {
+    if let Some(tokens) = context_window.fallback_used_tokens {
         let used_fmt = format_tokens_compact(tokens);
-        return Line::from(vec![Span::from(format!("{used_fmt} used")).dim()]);
+        return format!("{used_fmt} used");
     }
 
-    Line::from(vec![Span::from("100% context left").dim()])
+    "100% context left".to_string()
+}
+
+pub(crate) fn context_window_line(context_window: ContextWindowDisplay) -> Line<'static> {
+    Line::from(vec![
+        Span::from(context_window_summary_text(context_window)).dim(),
+    ])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1083,10 +1167,7 @@ mod tests {
                         compact
                     }
                 } else {
-                    Some(context_window_line(
-                        props.context_window_percent,
-                        props.context_window_used_tokens,
-                    ))
+                    Some(context_window_line(props.context_window))
                 };
                 let right_width = right_line
                     .as_ref()
@@ -1209,8 +1290,11 @@ mod tests {
                 collaboration_modes_enabled: false,
                 is_wsl: false,
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                context_window_percent: None,
-                context_window_used_tokens: None,
+                context_window: ContextWindowDisplay {
+                    percent_remaining: None,
+                    fallback_used_tokens: None,
+                    ..Default::default()
+                },
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1226,8 +1310,11 @@ mod tests {
                 collaboration_modes_enabled: false,
                 is_wsl: false,
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                context_window_percent: None,
-                context_window_used_tokens: None,
+                context_window: ContextWindowDisplay {
+                    percent_remaining: None,
+                    fallback_used_tokens: None,
+                    ..Default::default()
+                },
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1243,8 +1330,11 @@ mod tests {
                 collaboration_modes_enabled: true,
                 is_wsl: false,
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                context_window_percent: None,
-                context_window_used_tokens: None,
+                context_window: ContextWindowDisplay {
+                    percent_remaining: None,
+                    fallback_used_tokens: None,
+                    ..Default::default()
+                },
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1260,8 +1350,11 @@ mod tests {
                 collaboration_modes_enabled: false,
                 is_wsl: false,
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                context_window_percent: None,
-                context_window_used_tokens: None,
+                context_window: ContextWindowDisplay {
+                    percent_remaining: None,
+                    fallback_used_tokens: None,
+                    ..Default::default()
+                },
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1277,8 +1370,11 @@ mod tests {
                 collaboration_modes_enabled: false,
                 is_wsl: false,
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                context_window_percent: None,
-                context_window_used_tokens: None,
+                context_window: ContextWindowDisplay {
+                    percent_remaining: None,
+                    fallback_used_tokens: None,
+                    ..Default::default()
+                },
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1294,8 +1390,11 @@ mod tests {
                 collaboration_modes_enabled: false,
                 is_wsl: false,
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                context_window_percent: None,
-                context_window_used_tokens: None,
+                context_window: ContextWindowDisplay {
+                    percent_remaining: None,
+                    fallback_used_tokens: None,
+                    ..Default::default()
+                },
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1311,8 +1410,11 @@ mod tests {
                 collaboration_modes_enabled: false,
                 is_wsl: false,
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                context_window_percent: None,
-                context_window_used_tokens: None,
+                context_window: ContextWindowDisplay {
+                    percent_remaining: None,
+                    fallback_used_tokens: None,
+                    ..Default::default()
+                },
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1328,8 +1430,11 @@ mod tests {
                 collaboration_modes_enabled: false,
                 is_wsl: false,
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                context_window_percent: Some(72),
-                context_window_used_tokens: None,
+                context_window: ContextWindowDisplay {
+                    percent_remaining: Some(72),
+                    fallback_used_tokens: None,
+                    ..Default::default()
+                },
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1345,8 +1450,55 @@ mod tests {
                 collaboration_modes_enabled: false,
                 is_wsl: false,
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                context_window_percent: None,
-                context_window_used_tokens: Some(123_456),
+                context_window: ContextWindowDisplay {
+                    percent_remaining: None,
+                    fallback_used_tokens: Some(123_456),
+                    ..Default::default()
+                },
+                status_line_value: None,
+                status_line_enabled: false,
+            },
+        );
+
+        snapshot_footer(
+            "footer_context_remaining_and_compact_progress",
+            FooterProps {
+                mode: FooterMode::ComposerEmpty,
+                esc_backtrack_hint: false,
+                use_shift_enter_hint: false,
+                is_task_running: false,
+                collaboration_modes_enabled: false,
+                is_wsl: false,
+                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+                context_window: ContextWindowDisplay {
+                    percent_remaining: Some(58),
+                    fallback_used_tokens: None,
+                    tokens_in_window: Some(114_000),
+                    total_tokens: Some(272_000),
+                    auto_compact_token_limit: Some(244_800),
+                },
+                status_line_value: None,
+                status_line_enabled: false,
+            },
+        );
+
+        snapshot_footer(
+            "footer_context_compact_only_progress",
+            FooterProps {
+                mode: FooterMode::ComposerEmpty,
+                esc_backtrack_hint: false,
+                use_shift_enter_hint: false,
+                is_task_running: false,
+                collaboration_modes_enabled: false,
+                is_wsl: false,
+                quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+                context_window: ContextWindowDisplay {
+                    percent_remaining: None,
+                    fallback_used_tokens: None,
+                    tokens_in_window: Some(114_000),
+                    total_tokens: None,
+                    auto_compact_token_limit: Some(244_800),
+                },
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1362,8 +1514,11 @@ mod tests {
                 collaboration_modes_enabled: false,
                 is_wsl: false,
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-                context_window_percent: None,
-                context_window_used_tokens: None,
+                context_window: ContextWindowDisplay {
+                    percent_remaining: None,
+                    fallback_used_tokens: None,
+                    ..Default::default()
+                },
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1377,8 +1532,11 @@ mod tests {
             collaboration_modes_enabled: true,
             is_wsl: false,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-            context_window_percent: None,
-            context_window_used_tokens: None,
+            context_window: ContextWindowDisplay {
+                percent_remaining: None,
+                fallback_used_tokens: None,
+                ..Default::default()
+            },
             status_line_value: None,
             status_line_enabled: false,
         };
@@ -1405,8 +1563,11 @@ mod tests {
             collaboration_modes_enabled: true,
             is_wsl: false,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-            context_window_percent: None,
-            context_window_used_tokens: None,
+            context_window: ContextWindowDisplay {
+                percent_remaining: None,
+                fallback_used_tokens: None,
+                ..Default::default()
+            },
             status_line_value: None,
             status_line_enabled: false,
         };
@@ -1426,8 +1587,11 @@ mod tests {
             collaboration_modes_enabled: false,
             is_wsl: false,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-            context_window_percent: None,
-            context_window_used_tokens: None,
+            context_window: ContextWindowDisplay {
+                percent_remaining: None,
+                fallback_used_tokens: None,
+                ..Default::default()
+            },
             status_line_value: Some(Line::from("Status line content".to_string())),
             status_line_enabled: true,
         };
@@ -1442,8 +1606,11 @@ mod tests {
             collaboration_modes_enabled: false,
             is_wsl: false,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-            context_window_percent: None,
-            context_window_used_tokens: None,
+            context_window: ContextWindowDisplay {
+                percent_remaining: None,
+                fallback_used_tokens: None,
+                ..Default::default()
+            },
             status_line_value: Some(Line::from("Status line content".to_string())),
             status_line_enabled: true,
         };
@@ -1458,8 +1625,11 @@ mod tests {
             collaboration_modes_enabled: false,
             is_wsl: false,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-            context_window_percent: None,
-            context_window_used_tokens: None,
+            context_window: ContextWindowDisplay {
+                percent_remaining: None,
+                fallback_used_tokens: None,
+                ..Default::default()
+            },
             status_line_value: Some(Line::from("Status line content".to_string())),
             status_line_enabled: true,
         };
@@ -1474,8 +1644,11 @@ mod tests {
             collaboration_modes_enabled: true,
             is_wsl: false,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-            context_window_percent: Some(50),
-            context_window_used_tokens: None,
+            context_window: ContextWindowDisplay {
+                percent_remaining: Some(50),
+                fallback_used_tokens: None,
+                ..Default::default()
+            },
             status_line_value: None, // command timed out / empty
             status_line_enabled: true,
         };
@@ -1495,8 +1668,11 @@ mod tests {
             collaboration_modes_enabled: true,
             is_wsl: false,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-            context_window_percent: Some(50),
-            context_window_used_tokens: None,
+            context_window: ContextWindowDisplay {
+                percent_remaining: Some(50),
+                fallback_used_tokens: None,
+                ..Default::default()
+            },
             status_line_value: None,
             status_line_enabled: false,
         };
@@ -1516,8 +1692,11 @@ mod tests {
             collaboration_modes_enabled: false,
             is_wsl: false,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-            context_window_percent: Some(50),
-            context_window_used_tokens: None,
+            context_window: ContextWindowDisplay {
+                percent_remaining: Some(50),
+                fallback_used_tokens: None,
+                ..Default::default()
+            },
             status_line_value: None,
             status_line_enabled: true,
         };
@@ -1538,8 +1717,11 @@ mod tests {
             collaboration_modes_enabled: true,
             is_wsl: false,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-            context_window_percent: Some(50),
-            context_window_used_tokens: None,
+            context_window: ContextWindowDisplay {
+                percent_remaining: Some(50),
+                fallback_used_tokens: None,
+                ..Default::default()
+            },
             status_line_value: Some(Line::from(
                 "Status line content that should truncate before the mode indicator".to_string(),
             )),
@@ -1564,8 +1746,11 @@ mod tests {
             collaboration_modes_enabled: true,
             is_wsl: false,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
-            context_window_percent: Some(50),
-            context_window_used_tokens: None,
+            context_window: ContextWindowDisplay {
+                percent_remaining: Some(50),
+                fallback_used_tokens: None,
+                ..Default::default()
+            },
             status_line_value: Some(Line::from(
                 "Status line content that is definitely too long to fit alongside the mode label"
                     .to_string(),

@@ -1705,7 +1705,8 @@ impl ChatWidget {
         match info {
             Some(info) => self.apply_token_info(info),
             None => {
-                self.bottom_pane.set_context_window(None, None);
+                self.bottom_pane
+                    .set_context_window(None, None, None, None, None);
                 self.token_info = None;
             }
         }
@@ -1714,7 +1715,16 @@ impl ChatWidget {
     fn apply_token_info(&mut self, info: TokenUsageInfo) {
         let percent = self.context_remaining_percent(&info);
         let used_tokens = self.context_used_tokens(&info, percent.is_some());
-        self.bottom_pane.set_context_window(percent, used_tokens);
+        let total_tokens = self.context_window_total_tokens(&info);
+        let tokens_in_window = Some(info.last_token_usage.tokens_in_context_window());
+        let auto_compact_token_limit = self.context_window_auto_compact_limit(&info, total_tokens);
+        self.bottom_pane.set_context_window(
+            percent,
+            used_tokens,
+            tokens_in_window,
+            total_tokens,
+            auto_compact_token_limit,
+        );
         self.token_info = Some(info);
     }
 
@@ -1733,12 +1743,29 @@ impl ChatWidget {
         Some(info.total_token_usage.tokens_in_context_window())
     }
 
+    fn context_window_total_tokens(&self, info: &TokenUsageInfo) -> Option<i64> {
+        info.model_full_context_window
+            .or(self.config.model_context_window)
+            .or(info.model_context_window)
+    }
+
+    fn context_window_auto_compact_limit(
+        &self,
+        info: &TokenUsageInfo,
+        total_tokens: Option<i64>,
+    ) -> Option<i64> {
+        info.model_auto_compact_token_limit
+            .or(self.config.model_auto_compact_token_limit)
+            .or_else(|| total_tokens.map(|total| (total * 9) / 10))
+    }
+
     fn restore_pre_review_token_info(&mut self) {
         if let Some(saved) = self.pre_review_token_info.take() {
             match saved {
                 Some(info) => self.apply_token_info(info),
                 None => {
-                    self.bottom_pane.set_context_window(None, None);
+                    self.bottom_pane
+                        .set_context_window(None, None, None, None, None);
                     self.token_info = None;
                 }
             }
@@ -5307,9 +5334,7 @@ impl ChatWidget {
                     Some(format!("{} used", format_tokens_compact(total)))
                 }
             }
-            StatusLineItem::ContextRemaining => self
-                .status_line_context_remaining_percent()
-                .map(|remaining| format!("{remaining}% left")),
+            StatusLineItem::ContextRemaining => self.status_line_context_remaining_display(),
             StatusLineItem::ContextUsed => self
                 .status_line_context_used_percent()
                 .map(|used| format!("{used}% used")),
@@ -5361,8 +5386,76 @@ impl ChatWidget {
     fn status_line_context_window_size(&self) -> Option<i64> {
         self.token_info
             .as_ref()
-            .and_then(|info| info.model_context_window)
+            .and_then(|info| self.context_window_total_tokens(info))
             .or(self.config.model_context_window)
+    }
+
+    fn status_line_context_tokens_in_window(&self) -> i64 {
+        self.token_info
+            .as_ref()
+            .map(|info| info.last_token_usage.tokens_in_context_window())
+            .unwrap_or_default()
+    }
+
+    fn status_line_auto_compact_limit(&self) -> Option<i64> {
+        let total_tokens = self
+            .token_info
+            .as_ref()
+            .and_then(|info| self.context_window_total_tokens(info))
+            .or(self.config.model_context_window);
+
+        self.token_info
+            .as_ref()
+            .and_then(|info| info.model_auto_compact_token_limit)
+            .or(self.config.model_auto_compact_token_limit)
+            .or_else(|| total_tokens.map(|total| (total * 9) / 10))
+    }
+
+    fn status_line_context_budget_display(&self, label: &str, limit: i64) -> String {
+        let used_tokens = self.status_line_context_tokens_in_window();
+        let remaining_tokens = limit.saturating_sub(used_tokens).max(0);
+        let percent_remaining = if limit <= 0 {
+            0
+        } else {
+            ((remaining_tokens as f64 / limit as f64) * 100.0)
+                .clamp(0.0, 100.0)
+                .round() as i64
+        };
+        let filled = ((percent_remaining as f64 / 100.0) * 6.0).round() as usize;
+        let filled = filled.min(6);
+        let empty = 6usize.saturating_sub(filled);
+        format!(
+            "{label} [{}{}] {}",
+            "█".repeat(filled),
+            "░".repeat(empty),
+            format_tokens_compact(remaining_tokens)
+        )
+    }
+
+    fn status_line_context_remaining_display(&self) -> Option<String> {
+        let full_limit = self.status_line_context_window_size();
+        let compact_limit = self
+            .status_line_auto_compact_limit()
+            .zip(full_limit)
+            .map(|(compact_limit, full_limit)| compact_limit.min(full_limit))
+            .or(self.status_line_auto_compact_limit());
+
+        match (full_limit, compact_limit) {
+            (Some(full_limit), Some(compact_limit)) => Some(format!(
+                "{} · {}",
+                self.status_line_context_budget_display("Full", full_limit),
+                self.status_line_context_budget_display("Compact", compact_limit)
+            )),
+            (Some(full_limit), None) => {
+                Some(self.status_line_context_budget_display("Full", full_limit))
+            }
+            (None, Some(compact_limit)) => {
+                Some(self.status_line_context_budget_display("Compact", compact_limit))
+            }
+            (None, None) => self
+                .status_line_context_remaining_percent()
+                .map(|remaining| format!("{remaining}% left")),
+        }
     }
 
     fn status_line_context_remaining_percent(&self) -> Option<i64> {

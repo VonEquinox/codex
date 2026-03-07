@@ -55,7 +55,7 @@ impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
             items: Vec::new(),
-            token_info: TokenUsageInfo::new_or_append(&None, &None, None),
+            token_info: TokenUsageInfo::new_or_append(&None, &None, None, None, None),
             reference_context_item: None,
         }
     }
@@ -238,11 +238,15 @@ impl ContextManager {
         &mut self,
         usage: &TokenUsage,
         model_context_window: Option<i64>,
+        model_full_context_window: Option<i64>,
+        model_auto_compact_token_limit: Option<i64>,
     ) {
         self.token_info = TokenUsageInfo::new_or_append(
             &self.token_info,
             &Some(usage.clone()),
             model_context_window,
+            model_full_context_window,
+            model_auto_compact_token_limit,
         );
     }
 

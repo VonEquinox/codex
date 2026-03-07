@@ -155,6 +155,7 @@ use super::command_popup::CommandPopup;
 use super::command_popup::CommandPopupFlags;
 use super::file_search_popup::FileSearchPopup;
 use super::footer::CollaborationModeIndicator;
+use super::footer::ContextWindowDisplay;
 use super::footer::FooterMode;
 use super::footer::FooterProps;
 use super::footer::SummaryLeft;
@@ -391,6 +392,9 @@ pub(crate) struct ChatComposer {
     #[cfg(not(target_os = "linux"))]
     next_element_id: u64,
     context_window_used_tokens: Option<i64>,
+    context_window_tokens_in_window: Option<i64>,
+    context_window_total_tokens: Option<i64>,
+    context_window_auto_compact_limit: Option<i64>,
     skills: Option<Vec<SkillMetadata>>,
     plugins: Option<Vec<PluginCapabilitySummary>>,
     connectors_snapshot: Option<ConnectorsSnapshot>,
@@ -511,6 +515,9 @@ impl ChatComposer {
             #[cfg(not(target_os = "linux"))]
             next_element_id: 0,
             context_window_used_tokens: None,
+            context_window_tokens_in_window: None,
+            context_window_total_tokens: None,
+            context_window_auto_compact_limit: None,
             skills: None,
             plugins: None,
             connectors_snapshot: None,
@@ -3185,8 +3192,13 @@ impl ChatComposer {
             quit_shortcut_key: self.quit_shortcut_key,
             collaboration_modes_enabled: self.collaboration_modes_enabled,
             is_wsl,
-            context_window_percent: self.context_window_percent,
-            context_window_used_tokens: self.context_window_used_tokens,
+            context_window: ContextWindowDisplay {
+                percent_remaining: self.context_window_percent,
+                fallback_used_tokens: self.context_window_used_tokens,
+                tokens_in_window: self.context_window_tokens_in_window,
+                total_tokens: self.context_window_total_tokens,
+                auto_compact_token_limit: self.context_window_auto_compact_limit,
+            },
             status_line_value: self.status_line_value.clone(),
             status_line_enabled: self.status_line_enabled,
         }
@@ -3710,13 +3722,27 @@ impl ChatComposer {
         self.is_task_running = running;
     }
 
-    pub(crate) fn set_context_window(&mut self, percent: Option<i64>, used_tokens: Option<i64>) {
-        if self.context_window_percent == percent && self.context_window_used_tokens == used_tokens
+    pub(crate) fn set_context_window(
+        &mut self,
+        percent: Option<i64>,
+        used_tokens: Option<i64>,
+        tokens_in_window: Option<i64>,
+        total_tokens: Option<i64>,
+        auto_compact_token_limit: Option<i64>,
+    ) {
+        if self.context_window_percent == percent
+            && self.context_window_used_tokens == used_tokens
+            && self.context_window_tokens_in_window == tokens_in_window
+            && self.context_window_total_tokens == total_tokens
+            && self.context_window_auto_compact_limit == auto_compact_token_limit
         {
             return;
         }
         self.context_window_percent = percent;
         self.context_window_used_tokens = used_tokens;
+        self.context_window_tokens_in_window = tokens_in_window;
+        self.context_window_total_tokens = total_tokens;
+        self.context_window_auto_compact_limit = auto_compact_token_limit;
     }
 
     pub(crate) fn set_esc_backtrack_hint(&mut self, show: bool) {
@@ -4259,10 +4285,7 @@ impl ChatComposer {
                         compact
                     }
                 } else {
-                    Some(context_window_line(
-                        footer_props.context_window_percent,
-                        footer_props.context_window_used_tokens,
-                    ))
+                    Some(context_window_line(footer_props.context_window))
                 };
                 let right_width = right_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
                 if status_line_active
@@ -4741,7 +4764,7 @@ mod tests {
         ) {
             composer.set_collaboration_modes_enabled(true);
             composer.set_collaboration_mode_indicator(indicator);
-            composer.set_context_window(Some(context_percent), None);
+            composer.set_context_window(Some(context_percent), None, None, None, None);
         }
 
         // Empty textarea, agent idle: shortcuts hint can show, and cycle hint is hidden.

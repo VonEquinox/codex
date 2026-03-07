@@ -30,7 +30,7 @@ fn expected_summary(conversation_id: ThreadId, path: PathBuf) -> ConversationSum
         updated_at: Some(META_RFC3339.to_string()),
         model_provider: MODEL_PROVIDER.to_string(),
         cwd: PathBuf::from("/"),
-        cli_version: "0.0.0".to_string(),
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
         source: SessionSource::Cli,
         git_info: None,
     }

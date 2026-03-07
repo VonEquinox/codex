@@ -363,7 +363,7 @@ async fn thread_list_pagination_next_cursor_none_on_last_page() -> Result<()> {
         assert!(thread.created_at > 0);
         assert_eq!(thread.updated_at, thread.created_at);
         assert_eq!(thread.cwd, PathBuf::from("/"));
-        assert_eq!(thread.cli_version, "0.0.0");
+        assert_eq!(thread.cli_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(thread.source, SessionSource::Cli);
         assert_eq!(thread.git_info, None);
         assert_eq!(thread.status, ThreadStatus::NotLoaded);
@@ -390,7 +390,7 @@ async fn thread_list_pagination_next_cursor_none_on_last_page() -> Result<()> {
         assert!(thread.created_at > 0);
         assert_eq!(thread.updated_at, thread.created_at);
         assert_eq!(thread.cwd, PathBuf::from("/"));
-        assert_eq!(thread.cli_version, "0.0.0");
+        assert_eq!(thread.cli_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(thread.source, SessionSource::Cli);
         assert_eq!(thread.git_info, None);
         assert_eq!(thread.status, ThreadStatus::NotLoaded);
@@ -446,7 +446,7 @@ async fn thread_list_respects_provider_filter() -> Result<()> {
     assert_eq!(thread.created_at, expected_ts);
     assert_eq!(thread.updated_at, expected_ts);
     assert_eq!(thread.cwd, PathBuf::from("/"));
-    assert_eq!(thread.cli_version, "0.0.0");
+    assert_eq!(thread.cli_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(thread.source, SessionSource::Cli);
     assert_eq!(thread.git_info, None);
 
@@ -994,7 +994,7 @@ async fn thread_list_includes_git_info() -> Result<()> {
     assert_eq!(thread.git_info, Some(expected_git));
     assert_eq!(thread.source, SessionSource::Cli);
     assert_eq!(thread.cwd, PathBuf::from("/"));
-    assert_eq!(thread.cli_version, "0.0.0");
+    assert_eq!(thread.cli_version, env!("CARGO_PKG_VERSION"));
 
     Ok(())
 }

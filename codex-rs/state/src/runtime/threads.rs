@@ -1025,6 +1025,8 @@ mod tests {
                     },
                     last_token_usage: codex_protocol::protocol::TokenUsage::default(),
                     model_context_window: None,
+                    model_full_context_window: None,
+                    model_auto_compact_token_limit: None,
                 }),
                 rate_limits: None,
             },

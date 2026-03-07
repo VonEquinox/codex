@@ -1583,6 +1583,14 @@ pub struct TokenUsageInfo {
     // TODO(aibrahim): make this not optional
     #[ts(type = "number | null")]
     pub model_context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number | null")]
+    pub model_full_context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number | null")]
+    pub model_auto_compact_token_limit: Option<i64>,
 }
 
 impl TokenUsageInfo {
@@ -1590,6 +1598,8 @@ impl TokenUsageInfo {
         info: &Option<TokenUsageInfo>,
         last: &Option<TokenUsage>,
         model_context_window: Option<i64>,
+        model_full_context_window: Option<i64>,
+        model_auto_compact_token_limit: Option<i64>,
     ) -> Option<Self> {
         if info.is_none() && last.is_none() {
             return None;
@@ -1601,6 +1611,8 @@ impl TokenUsageInfo {
                 total_token_usage: TokenUsage::default(),
                 last_token_usage: TokenUsage::default(),
                 model_context_window,
+                model_full_context_window,
+                model_auto_compact_token_limit,
             },
         };
         if let Some(last) = last {
@@ -1608,6 +1620,12 @@ impl TokenUsageInfo {
         }
         if let Some(model_context_window) = model_context_window {
             info.model_context_window = Some(model_context_window);
+        }
+        if let Some(model_full_context_window) = model_full_context_window {
+            info.model_full_context_window = Some(model_full_context_window);
+        }
+        if let Some(model_auto_compact_token_limit) = model_auto_compact_token_limit {
+            info.model_auto_compact_token_limit = Some(model_auto_compact_token_limit);
         }
         Some(info)
     }
@@ -1637,6 +1655,8 @@ impl TokenUsageInfo {
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(context_window),
+            model_full_context_window: None,
+            model_auto_compact_token_limit: None,
         };
         info.fill_to_context_window(context_window);
         info
@@ -3929,6 +3949,8 @@ mod tests {
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
+            model_full_context_window: Some(272_000),
+            model_auto_compact_token_limit: Some(240_000),
         });
         let last = Some(TokenUsage {
             input_tokens: 10,
@@ -3938,10 +3960,18 @@ mod tests {
             total_tokens: 10,
         });
 
-        let info = TokenUsageInfo::new_or_append(&initial, &last, Some(128_000))
-            .expect("new_or_append should return info");
+        let info = TokenUsageInfo::new_or_append(
+            &initial,
+            &last,
+            Some(128_000),
+            Some(256_000),
+            Some(200_000),
+        )
+        .expect("new_or_append should return info");
 
         assert_eq!(info.model_context_window, Some(128_000));
+        assert_eq!(info.model_full_context_window, Some(256_000));
+        assert_eq!(info.model_auto_compact_token_limit, Some(200_000));
     }
 
     #[test]
@@ -3950,6 +3980,8 @@ mod tests {
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
+            model_full_context_window: Some(272_000),
+            model_auto_compact_token_limit: Some(240_000),
         });
         let last = Some(TokenUsage {
             input_tokens: 10,
@@ -3959,9 +3991,11 @@ mod tests {
             total_tokens: 10,
         });
 
-        let info = TokenUsageInfo::new_or_append(&initial, &last, None)
+        let info = TokenUsageInfo::new_or_append(&initial, &last, None, None, None)
             .expect("new_or_append should return info");
 
         assert_eq!(info.model_context_window, Some(258_400));
+        assert_eq!(info.model_full_context_window, Some(272_000));
+        assert_eq!(info.model_auto_compact_token_limit, Some(240_000));
     }
 }

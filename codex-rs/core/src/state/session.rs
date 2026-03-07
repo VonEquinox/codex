@@ -102,8 +102,15 @@ impl SessionState {
         &mut self,
         usage: &TokenUsage,
         model_context_window: Option<i64>,
+        model_full_context_window: Option<i64>,
+        model_auto_compact_token_limit: Option<i64>,
     ) {
-        self.history.update_token_info(usage, model_context_window);
+        self.history.update_token_info(
+            usage,
+            model_context_window,
+            model_full_context_window,
+            model_auto_compact_token_limit,
+        );
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {

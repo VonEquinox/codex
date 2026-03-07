@@ -69,9 +69,13 @@ pub struct ModelProviderInfo {
     /// variable and set it.
     pub env_key_instructions: Option<String>,
 
-    /// Value to use with `Authorization: Bearer <token>` header. Use of this
-    /// config is discouraged in favor of `env_key` for security reasons, but
-    /// this may be necessary when using this programmatically.
+    /// Value to use with `Authorization: Bearer <token>` header.
+    ///
+    /// This is exposed as `api_key` in `config.toml`. Use of this config is
+    /// discouraged in favor of `env_key` for security reasons, but this may be
+    /// necessary when using this programmatically.
+    #[serde(rename = "api_key", alias = "experimental_bearer_token")]
+    #[schemars(rename = "api_key")]
     pub experimental_bearer_token: Option<String>,
 
     /// Which wire protocol this provider expects.
@@ -174,9 +178,11 @@ impl ModelProviderInfo {
         })
     }
 
-    /// If `env_key` is Some, returns the API key for this provider if present
-    /// (and non-empty) in the environment. If `env_key` is required but
-    /// cannot be found, returns an error.
+    /// Returns the API key for this provider.
+    ///
+    /// If `env_key` is configured, that environment variable remains the
+    /// authoritative source and a missing value is treated as an error.
+    /// Otherwise, fall back to the inline `api_key` config field when present.
     pub fn api_key(&self) -> crate::error::Result<Option<String>> {
         match &self.env_key {
             Some(env_key) => {
@@ -191,7 +197,7 @@ impl ModelProviderInfo {
                     })?;
                 Ok(Some(api_key))
             }
-            None => Ok(None),
+            None => Ok(self.experimental_bearer_token.clone()),
         }
     }
 
@@ -333,6 +339,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
 
     #[test]
     fn test_deserialize_ollama_model_provider_toml() {
@@ -424,6 +431,96 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
         assert_eq!(expected_provider, provider);
+    }
+
+    #[test]
+    fn test_deserialize_inline_api_key_model_provider_toml() {
+        let provider_toml = r#"
+name = "Example"
+base_url = "https://example.com"
+api_key = "sk-inline"
+        "#;
+        let expected_provider = ModelProviderInfo {
+            name: "Example".into(),
+            base_url: Some("https://example.com".into()),
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: Some("sk-inline".into()),
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        };
+
+        let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
+        assert_eq!(expected_provider, provider);
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_key_prefers_env_key_over_inline_api_key() {
+        let env_key = "CODEX_TEST_MODEL_PROVIDER_API_KEY";
+        let provider = ModelProviderInfo {
+            name: "Example".into(),
+            base_url: Some("https://example.com".into()),
+            env_key: Some(env_key.into()),
+            env_key_instructions: None,
+            experimental_bearer_token: Some("sk-inline".into()),
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        };
+
+        unsafe {
+            std::env::set_var(env_key, "sk-env");
+        }
+        assert_eq!(provider.api_key().unwrap(), Some("sk-env".to_string()));
+        unsafe {
+            std::env::remove_var(env_key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_key_errors_when_env_key_missing_even_if_inline_api_key_exists() {
+        let env_key = "CODEX_TEST_MODEL_PROVIDER_API_KEY";
+        let provider = ModelProviderInfo {
+            name: "Example".into(),
+            base_url: Some("https://example.com".into()),
+            env_key: Some(env_key.into()),
+            env_key_instructions: None,
+            experimental_bearer_token: Some("sk-inline".into()),
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        };
+
+        unsafe {
+            std::env::remove_var(env_key);
+        }
+        let err = provider.api_key().unwrap_err();
+        let crate::error::CodexErr::EnvVar(err) = err else {
+            panic!("expected missing env var error");
+        };
+        assert_eq!(err.var, env_key.to_string());
+        assert_eq!(err.instructions, None);
     }
 
     #[test]

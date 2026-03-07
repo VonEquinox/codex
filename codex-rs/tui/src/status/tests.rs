@@ -40,12 +40,13 @@ fn test_auth_manager(config: &Config) -> AuthManager {
 }
 
 fn token_info_for(model_slug: &str, config: &Config, usage: &TokenUsage) -> TokenUsageInfo {
-    let context_window =
-        codex_core::test_support::construct_model_info_offline(model_slug, config).context_window;
+    let model_info = codex_core::test_support::construct_model_info_offline(model_slug, config);
     TokenUsageInfo {
         total_token_usage: usage.clone(),
         last_token_usage: usage.clone(),
-        model_context_window: context_window,
+        model_context_window: model_info.context_window,
+        model_full_context_window: model_info.context_window,
+        model_auto_compact_token_limit: model_info.auto_compact_token_limit,
     }
 }
 
@@ -997,6 +998,8 @@ async fn status_context_window_uses_last_usage() {
         total_token_usage: total_usage.clone(),
         last_token_usage: last_usage,
         model_context_window: config.model_context_window,
+        model_full_context_window: config.model_context_window,
+        model_auto_compact_token_limit: config.model_auto_compact_token_limit,
     };
     let composite = new_status_output(
         &config,

@@ -247,13 +247,6 @@ pub(crate) fn auth_provider_from_auth(
         });
     }
 
-    if let Some(token) = provider.experimental_bearer_token.clone() {
-        return Ok(CoreAuthProvider {
-            token: Some(token),
-            account_id: None,
-        });
-    }
-
     if let Some(auth) = auth {
         let token = auth.get_token()?;
         Ok(CoreAuthProvider {

@@ -151,7 +151,7 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
     assert_eq!(thread.model_provider, "mock_provider");
     assert!(thread.path.as_ref().expect("thread path").is_absolute());
     assert_eq!(thread.cwd, PathBuf::from("/"));
-    assert_eq!(thread.cli_version, "0.0.0");
+    assert_eq!(thread.cli_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(thread.source, SessionSource::Cli);
     assert_eq!(thread.git_info, None);
     assert_eq!(thread.status, ThreadStatus::Idle);
@@ -276,7 +276,7 @@ stream_max_retries = 0
         timestamp: "2025-01-05T12:00:00Z".to_string(),
         cwd: repo_path.clone(),
         originator: "codex".to_string(),
-        cli_version: "0.0.0".to_string(),
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
         source: RolloutSessionSource::Cli,
         agent_nickname: None,
         agent_role: None,

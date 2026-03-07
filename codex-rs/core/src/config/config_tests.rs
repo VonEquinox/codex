@@ -4518,6 +4518,78 @@ wire_api = "responses"
 }
 
 #[test]
+fn translation_provider_accepts_inline_api_key_from_config_toml() -> std::io::Result<()> {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[features]
+reasoning_summary_translation = true
+
+[translation]
+provider = "translator"
+model = "translator-model"
+
+[model_providers.translator]
+name = "Translator"
+base_url = "https://translator.example/v1"
+api_key = "translator-inline-key"
+wire_api = "responses"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    let translation = config.translation.expect("translation config should load");
+    assert_eq!(translation.provider_id, "translator");
+    assert_eq!(
+        translation.provider.experimental_bearer_token.as_deref(),
+        Some("translator-inline-key")
+    );
+    Ok(())
+}
+
+#[test]
+fn translation_provider_supports_legacy_experimental_bearer_token_alias() -> std::io::Result<()> {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[features]
+reasoning_summary_translation = true
+
+[translation]
+provider = "translator"
+model = "translator-model"
+
+[model_providers.translator]
+name = "Translator"
+base_url = "https://translator.example/v1"
+experimental_bearer_token = "translator-inline-key"
+wire_api = "responses"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    let translation = config.translation.expect("translation config should load");
+    assert_eq!(translation.provider_id, "translator");
+    assert_eq!(
+        translation.provider.experimental_bearer_token.as_deref(),
+        Some("translator-inline-key")
+    );
+    Ok(())
+}
+
+#[test]
 fn translation_is_disabled_when_feature_is_off() -> std::io::Result<()> {
     let cfg: ConfigToml = toml::from_str(
         r#"

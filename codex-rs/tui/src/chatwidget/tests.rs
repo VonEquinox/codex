@@ -1642,6 +1642,8 @@ async fn context_indicator_shows_used_tokens_when_window_unknown() {
         total_token_usage: token_usage.clone(),
         last_token_usage: token_usage,
         model_context_window: None,
+        model_full_context_window: None,
+        model_auto_compact_token_limit: Some(auto_compact_limit),
     };
 
     chat.handle_codex_event(Event {
@@ -1967,6 +1969,8 @@ fn make_token_info(total_tokens: i64, context_window: i64) -> TokenUsageInfo {
         total_token_usage: usage(total_tokens),
         last_token_usage: usage(total_tokens),
         model_context_window: Some(context_window),
+        model_full_context_window: Some(context_window),
+        model_auto_compact_token_limit: None,
     }
 }
 
@@ -9325,6 +9329,94 @@ async fn status_line_fast_mode_footer_snapshot() {
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw fast-mode footer");
     assert_snapshot!("status_line_fast_mode_footer", terminal.backend());
+}
+
+#[tokio::test]
+async fn status_line_context_remaining_uses_latest_context_window_usage() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.config.tui_status_line = Some(vec!["context-remaining".to_string()]);
+
+    chat.set_token_info(Some(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 102_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 13_679,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(258_400),
+        model_full_context_window: Some(272_000),
+        model_auto_compact_token_limit: Some(200_000),
+    }));
+    chat.refresh_status_line();
+
+    assert_eq!(
+        status_line_text(&chat),
+        Some("Full [██████] 258K · Compact [██████] 186K".to_string())
+    );
+}
+
+#[tokio::test]
+async fn status_line_context_remaining_prefers_config_full_window_and_default_compact_limit() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.config.tui_status_line = Some(vec!["context-remaining".to_string()]);
+    chat.config.model_context_window = Some(272_000);
+    chat.config.model_auto_compact_token_limit = None;
+
+    chat.set_token_info(Some(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 102_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 13_679,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(258_400),
+        model_full_context_window: None,
+        model_auto_compact_token_limit: None,
+    }));
+    chat.refresh_status_line();
+
+    assert_eq!(
+        status_line_text(&chat),
+        Some("Full [██████] 258K · Compact [██████] 231K".to_string())
+    );
+}
+
+#[tokio::test]
+async fn status_line_context_remaining_footer_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.show_welcome_banner = false;
+    chat.config.tui_status_line = Some(vec!["context-remaining".to_string()]);
+    chat.config.model_context_window = Some(272_000);
+    chat.config.model_auto_compact_token_limit = None;
+    chat.set_token_info(Some(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 102_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 13_679,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(258_400),
+        model_full_context_window: None,
+        model_auto_compact_token_limit: None,
+    }));
+    chat.refresh_status_line();
+
+    let width = 100;
+    let height = chat.desired_height(width);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw context-remaining footer");
+    assert_snapshot!("status_line_context_remaining_footer", terminal.backend());
 }
 
 #[tokio::test]

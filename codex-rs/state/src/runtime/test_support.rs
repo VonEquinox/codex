@@ -50,7 +50,7 @@ pub(super) fn test_thread_metadata(
         agent_role: None,
         model_provider: "test-provider".to_string(),
         cwd,
-        cli_version: "0.0.0".to_string(),
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
         title: String::new(),
         sandbox_policy: crate::extract::enum_to_string(&SandboxPolicy::new_read_only_policy()),
         approval_mode: crate::extract::enum_to_string(&AskForApproval::OnRequest),

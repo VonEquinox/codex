@@ -2821,6 +2821,8 @@ mod tests {
                 total_tokens: 23,
             },
             model_context_window: Some(4096),
+            model_full_context_window: None,
+            model_auto_compact_token_limit: None,
         };
         let rate_limits = RateLimitSnapshot {
             limit_id: Some("codex".to_string()),
