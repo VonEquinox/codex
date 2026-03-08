@@ -1,7 +1,5 @@
 use crate::config::Config;
 use crate::config::TranslationConfig;
-use codex_protocol::models::ReasoningItemReasoningSummary;
-use codex_protocol::models::ResponseItem;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +12,6 @@ pub(crate) struct PendingReasoningSummarySegment {
 pub(crate) struct ReasoningSummaryTranslationState {
     config: Option<TranslationConfig>,
     pending_segments: HashMap<String, PendingReasoningSummarySegment>,
-    translated_segments: HashMap<String, Vec<String>>,
 }
 
 impl ReasoningSummaryTranslationState {
@@ -22,7 +19,6 @@ impl ReasoningSummaryTranslationState {
         Self {
             config: config.translation.clone(),
             pending_segments: HashMap::new(),
-            translated_segments: HashMap::new(),
         }
     }
 
@@ -87,31 +83,5 @@ impl ReasoningSummaryTranslationState {
         self.pending_segments
             .remove(item_id)
             .filter(|segment| !segment.text.is_empty())
-    }
-
-    pub(crate) fn record_translated_segment(&mut self, item_id: &str, translated: String) {
-        self.translated_segments
-            .entry(item_id.to_string())
-            .or_default()
-            .push(translated);
-    }
-
-    pub(crate) fn take_translated_segments(&mut self, item_id: &str) -> Option<Vec<String>> {
-        self.translated_segments.remove(item_id)
-    }
-
-    pub(crate) fn replace_item_summary(item: &mut ResponseItem, segments: Vec<String>) -> bool {
-        let ResponseItem::Reasoning { summary, .. } = item else {
-            return false;
-        };
-        if summary.len() != segments.len() {
-            return false;
-        }
-
-        *summary = segments
-            .into_iter()
-            .map(|text| ReasoningItemReasoningSummary::SummaryText { text })
-            .collect();
-        true
     }
 }

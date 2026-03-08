@@ -28,7 +28,7 @@ When Codex knows which client started the turn, the legacy notify JSON payload a
 
 ## Reasoning summary translation
 
-Codex can translate reasoning summaries into Chinese when the experimental feature is enabled and a translation provider is configured.
+Codex can translate the live reasoning-summary display into Chinese when the experimental feature is enabled and a translation provider is configured.
 
 ```toml
 [features]
@@ -47,7 +47,7 @@ wire_api = "responses"
 
 Inline `api_key` works for custom providers, but `env_key` is still preferred for better secret hygiene.
 
-This affects reasoning summaries only. Final assistant messages are left unchanged. If the translation request fails, Codex falls back to the original reasoning text.
+This affects the displayed reasoning summary only. Canonical API content and final assistant messages are left unchanged. If the translation request fails, Codex falls back to the original reasoning text.
 
 ## JSON Schema
 

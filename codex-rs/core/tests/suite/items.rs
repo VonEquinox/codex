@@ -1101,7 +1101,7 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reasoning_summary_translation_translates_streamed_deltas_and_completed_item()
+async fn reasoning_summary_translation_keeps_canonical_items_raw_and_translates_display_deltas()
 -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1173,9 +1173,9 @@ async fn reasoning_summary_translation_translates_streamed_deltas_and_completed_
     })
     .await;
 
-    assert_eq!(delta_event.delta, "第一步");
+    assert_eq!(delta_event.delta, "step one");
     assert_eq!(legacy_delta.delta, "第一步");
-    assert_eq!(completed_item.summary_text, vec!["第一步".to_string()]);
+    assert_eq!(completed_item.summary_text, vec!["step one".to_string()]);
 
     let requests = translation_server
         .received_requests()
@@ -1239,6 +1239,11 @@ async fn reasoning_summary_translation_falls_back_to_original_text_on_failure() 
         _ => None,
     })
     .await;
+    let legacy_delta = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::AgentReasoningDelta(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
     let completed_item = wait_for_event_match(&codex, |ev| match ev {
         EventMsg::ItemCompleted(ItemCompletedEvent {
             item: TurnItem::Reasoning(item),
@@ -1249,6 +1254,7 @@ async fn reasoning_summary_translation_falls_back_to_original_text_on_failure() 
     .await;
 
     assert_eq!(delta_event.delta, "step one");
+    assert_eq!(legacy_delta.delta, "step one");
     assert_eq!(completed_item.summary_text, vec!["step one".to_string()]);
 
     Ok(())

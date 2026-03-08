@@ -2,7 +2,7 @@
 
 For a sample configuration file, see [this documentation](https://developers.openai.com/codex/config-sample).
 
-For reasoning-summary translation, add an experimental feature flag plus a dedicated translation provider/model in `config.toml`:
+For live reasoning-summary translation, add an experimental feature flag plus a dedicated translation provider/model in `config.toml`:
 
 ```toml
 [features]

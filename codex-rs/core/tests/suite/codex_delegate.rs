@@ -239,7 +239,7 @@ async fn codex_delegate_ignores_legacy_deltas() {
 
     assert_eq!(reasoning_delta_count, 1, "expected one new reasoning delta");
     assert_eq!(
-        legacy_reasoning_delta_count, 1,
-        "expected one legacy reasoning delta"
+        legacy_reasoning_delta_count, 0,
+        "expected delegated legacy reasoning deltas to stay filtered"
     );
 }
