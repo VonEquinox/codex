@@ -46,7 +46,7 @@ use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 
-const CONTEXT_BAR_SEGMENTS: usize = 6;
+const CONTEXT_BAR_SEGMENTS: usize = 8;
 const CONTEXT_BAR_FILLED: &str = "█";
 const CONTEXT_BAR_EMPTY: &str = "░";
 
@@ -79,7 +79,7 @@ pub(crate) struct FooterProps {
     /// This is rendered when `mode` is `FooterMode::QuitShortcutReminder`.
     pub(crate) quit_shortcut_key: KeyBinding,
     pub(crate) context_window: ContextWindowDisplay,
-    pub(crate) status_line_value: Option<Line<'static>>,
+    pub(crate) status_line_value: Option<Vec<Line<'static>>>,
     pub(crate) status_line_enabled: bool,
 }
 
@@ -199,14 +199,29 @@ pub(crate) fn footer_height(props: &FooterProps) -> u16 {
     footer_from_props_lines(props, None, false, show_shortcuts_hint, show_queue_hint).len() as u16
 }
 
-/// Render a single precomputed footer line.
-pub(crate) fn render_footer_line(area: Rect, buf: &mut Buffer, line: Line<'static>) {
+pub(crate) fn status_line_is_active(props: &FooterProps) -> bool {
+    props.status_line_enabled
+        && match props.mode {
+            FooterMode::ComposerEmpty => true,
+            FooterMode::ComposerHasDraft => !props.is_task_running,
+            FooterMode::QuitShortcutReminder
+            | FooterMode::ShortcutOverlay
+            | FooterMode::EscHint => false,
+        }
+}
+
+pub(crate) fn render_footer_lines(area: Rect, buf: &mut Buffer, lines: Vec<Line<'static>>) {
     Paragraph::new(prefix_lines(
-        vec![line],
+        lines,
         " ".repeat(FOOTER_INDENT_COLS).into(),
         " ".repeat(FOOTER_INDENT_COLS).into(),
     ))
     .render(area, buf);
+}
+
+/// Render a single precomputed footer line.
+pub(crate) fn render_footer_line(area: Rect, buf: &mut Buffer, line: Line<'static>) {
+    render_footer_lines(area, buf, vec![line]);
 }
 
 /// Render footer content directly from `FooterProps`.
@@ -225,7 +240,9 @@ pub(crate) fn render_footer_from_props(
     show_shortcuts_hint: bool,
     show_queue_hint: bool,
 ) {
-    Paragraph::new(prefix_lines(
+    render_footer_lines(
+        area,
+        buf,
         footer_from_props_lines(
             props,
             collaboration_mode_indicator,
@@ -233,10 +250,7 @@ pub(crate) fn render_footer_from_props(
             show_shortcuts_hint,
             show_queue_hint,
         ),
-        " ".repeat(FOOTER_INDENT_COLS).into(),
-        " ".repeat(FOOTER_INDENT_COLS).into(),
-    ))
-    .render(area, buf);
+    );
 }
 
 pub(crate) fn left_fits(area: Rect, left_width: u16) -> bool {
@@ -521,11 +535,24 @@ pub(crate) fn render_context_right(area: Rect, buf: &mut Buffer, line: &Line<'st
         return;
     }
 
+    render_context_right_on_row(area, buf, line, area.height.saturating_sub(1));
+}
+
+pub(crate) fn render_context_right_on_row(
+    area: Rect,
+    buf: &mut Buffer,
+    line: &Line<'static>,
+    row: u16,
+) {
+    if area.is_empty() || row >= area.height {
+        return;
+    }
+
     let context_width = line.width() as u16;
     let Some(mut x) = right_aligned_x(area, context_width) else {
         return;
     };
-    let y = area.y + area.height.saturating_sub(1);
+    let y = area.y + row;
     let max_x = area.x.saturating_add(area.width);
 
     for span in &line.spans {
@@ -577,17 +604,10 @@ fn footer_from_props_lines(
     // If status line content is present, show it for passive composer states.
     // Active draft states still prefer the queue hint over the passive status
     // line so the footer stays actionable while a task is running.
-    if props.status_line_enabled
+    if status_line_is_active(props)
         && let Some(status_line) = &props.status_line_value
-        && match props.mode {
-            FooterMode::ComposerEmpty => true,
-            FooterMode::ComposerHasDraft => !props.is_task_running,
-            FooterMode::QuitShortcutReminder
-            | FooterMode::ShortcutOverlay
-            | FooterMode::EscHint => false,
-        }
     {
-        return vec![status_line.clone().dim()];
+        return status_line.iter().cloned().map(ratatui::prelude::Stylize::dim).collect();
     }
     match props.mode {
         FooterMode::QuitShortcutReminder => {
@@ -1116,36 +1136,42 @@ mod tests {
                     | FooterMode::ShortcutOverlay
                     | FooterMode::EscHint => false,
                 };
-                let status_line_active = props.status_line_enabled
-                    && match props.mode {
-                        FooterMode::ComposerEmpty => true,
-                        FooterMode::ComposerHasDraft => !props.is_task_running,
-                        FooterMode::QuitShortcutReminder
-                        | FooterMode::ShortcutOverlay
-                        | FooterMode::EscHint => false,
-                    };
+                let status_line_candidate =
+                    status_line_is_active(props) && props.status_line_value.is_some();
+                let available_width = area.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
+                let build_status_line = |first_line_width: Option<usize>| {
+                    props.status_line_value.as_ref().map(|lines| {
+                        lines
+                            .iter()
+                            .cloned()
+                            .map(ratatui::prelude::Stylize::dim)
+                            .enumerate()
+                            .map(|(index, line)| {
+                                let max_width = if index == 0 {
+                                    first_line_width.unwrap_or(available_width)
+                                } else {
+                                    available_width
+                                };
+                                truncate_line_with_ellipsis_if_overflow(line, max_width)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let mut truncated_status_line = if status_line_candidate {
+                    build_status_line(None)
+                } else {
+                    None
+                };
+                let status_line_active = status_line_candidate;
                 let left_mode_indicator = if status_line_active {
                     None
                 } else {
                     collaboration_mode_indicator
                 };
-                let available_width = area.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
-                let mut truncated_status_line = if status_line_active
-                    && matches!(
-                        props.mode,
-                        FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft
-                    ) {
-                    props
-                        .status_line_value
-                        .as_ref()
-                        .map(|line| line.clone().dim())
-                        .map(|line| truncate_line_with_ellipsis_if_overflow(line, available_width))
-                } else {
-                    None
-                };
                 let mut left_width = if status_line_active {
                     truncated_status_line
                         .as_ref()
+                        .and_then(|lines| lines.first())
                         .map(|line| line.width() as u16)
                         .unwrap_or(0)
                 } else {
@@ -1166,6 +1192,8 @@ mod tests {
                     } else {
                         compact
                     }
+                } else if status_line_candidate {
+                    None
                 } else {
                     Some(context_window_line(props.context_window))
                 };
@@ -1176,16 +1204,11 @@ mod tests {
                 if status_line_active
                     && let Some(max_left) = max_left_width_for_right(area, right_width)
                     && left_width > max_left
-                    && let Some(line) = props
-                        .status_line_value
-                        .as_ref()
-                        .map(|line| line.clone().dim())
-                        .map(|line| {
-                            truncate_line_with_ellipsis_if_overflow(line, max_left as usize)
-                        })
+                    && let Some(lines) = build_status_line(Some(max_left as usize))
+                    && let Some(line) = lines.first()
                 {
                     left_width = line.width() as u16;
-                    truncated_status_line = Some(line);
+                    truncated_status_line = Some(lines);
                 }
                 let can_show_left_and_context =
                     can_show_left_with_context(area, left_width, right_width);
@@ -1194,12 +1217,22 @@ mod tests {
                     FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft
                 ) {
                     if status_line_active {
-                        if let Some(line) = truncated_status_line.clone() {
-                            render_footer_line(area, f.buffer_mut(), line);
+                        if let Some(lines) = truncated_status_line.clone() {
+                            render_footer_lines(area, f.buffer_mut(), lines);
                         }
                         if can_show_left_and_context && let Some(line) = &right_line {
-                            render_context_right(area, f.buffer_mut(), line);
+                            render_context_right_on_row(area, f.buffer_mut(), line, 0);
                         }
+                    } else if status_line_candidate {
+                        render_footer_from_props(
+                            area,
+                            f.buffer_mut(),
+                            props,
+                            left_mode_indicator,
+                            show_cycle_hint,
+                            show_shortcuts_hint,
+                            show_queue_hint,
+                        );
                     } else {
                         let (summary_left, show_context) = single_line_footer_layout(
                             area,
@@ -1592,7 +1625,7 @@ mod tests {
                 fallback_used_tokens: None,
                 ..Default::default()
             },
-            status_line_value: Some(Line::from("Status line content".to_string())),
+            status_line_value: Some(vec![Line::from("Status line content".to_string())]),
             status_line_enabled: true,
         };
 
@@ -1611,7 +1644,7 @@ mod tests {
                 fallback_used_tokens: None,
                 ..Default::default()
             },
-            status_line_value: Some(Line::from("Status line content".to_string())),
+            status_line_value: Some(vec![Line::from("Status line content".to_string())]),
             status_line_enabled: true,
         };
 
@@ -1630,11 +1663,40 @@ mod tests {
                 fallback_used_tokens: None,
                 ..Default::default()
             },
-            status_line_value: Some(Line::from("Status line content".to_string())),
+            status_line_value: Some(vec![Line::from("Status line content".to_string())]),
             status_line_enabled: true,
         };
 
         snapshot_footer("footer_status_line_overrides_draft_idle", props);
+
+        let props = FooterProps {
+            mode: FooterMode::ComposerEmpty,
+            esc_backtrack_hint: false,
+            use_shift_enter_hint: false,
+            is_task_running: false,
+            collaboration_modes_enabled: true,
+            is_wsl: false,
+            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+            context_window: ContextWindowDisplay {
+                percent_remaining: None,
+                fallback_used_tokens: None,
+                ..Default::default()
+            },
+            status_line_value: Some(vec![
+                Line::from(
+                    "gpt-5.4 xhigh · Full [████████] 258K · Compact [████████] 231K".to_string(),
+                ),
+                Line::from("/repo".to_string()),
+            ]),
+            status_line_enabled: true,
+        };
+
+        snapshot_footer_with_mode_indicator(
+            "footer_status_line_two_lines_mode_right",
+            110,
+            &props,
+            Some(CollaborationModeIndicator::Plan),
+        );
 
         let props = FooterProps {
             mode: FooterMode::ComposerEmpty,
@@ -1722,9 +1784,9 @@ mod tests {
                 fallback_used_tokens: None,
                 ..Default::default()
             },
-            status_line_value: Some(Line::from(
+            status_line_value: Some(vec![Line::from(
                 "Status line content that should truncate before the mode indicator".to_string(),
-            )),
+            )]),
             status_line_enabled: true,
         };
 
@@ -1751,10 +1813,10 @@ mod tests {
                 fallback_used_tokens: None,
                 ..Default::default()
             },
-            status_line_value: Some(Line::from(
+            status_line_value: Some(vec![Line::from(
                 "Status line content that is definitely too long to fit alongside the mode label"
                     .to_string(),
-            )),
+            )]),
             status_line_enabled: true,
         };
 

@@ -9353,7 +9353,7 @@ async fn status_line_context_remaining_uses_latest_context_window_usage() {
 
     assert_eq!(
         status_line_text(&chat),
-        Some("Full [██████] 258K · Compact [██████] 186K".to_string())
+        Some("Full [████████] 258K · Compact [███████░] 186K".to_string())
     );
 }
 
@@ -9381,7 +9381,41 @@ async fn status_line_context_remaining_prefers_config_full_window_and_default_co
 
     assert_eq!(
         status_line_text(&chat),
-        Some("Full [██████] 258K · Compact [██████] 231K".to_string())
+        Some("Full [████████] 258K · Compact [████████] 231K".to_string())
+    );
+}
+
+#[tokio::test]
+async fn status_line_moves_current_dir_to_second_line() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    chat.config.tui_status_line = Some(vec![
+        "model-with-reasoning".to_string(),
+        "context-remaining".to_string(),
+        "current-dir".to_string(),
+    ]);
+    chat.config.cwd = PathBuf::from("/repo");
+    chat.current_cwd = Some(PathBuf::from("/repo"));
+    chat.config.model_context_window = Some(272_000);
+    chat.config.model_auto_compact_token_limit = None;
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+    chat.set_token_info(Some(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 102_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 13_679,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(258_400),
+        model_full_context_window: None,
+        model_auto_compact_token_limit: None,
+    }));
+    chat.refresh_status_line();
+
+    assert_eq!(
+        status_line_text(&chat),
+        Some("gpt-5.4 xhigh · Full [████████] 258K · Compact [████████] 231K\n/repo".to_string())
     );
 }
 
@@ -9417,6 +9451,47 @@ async fn status_line_context_remaining_footer_snapshot() {
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw context-remaining footer");
     assert_snapshot!("status_line_context_remaining_footer", terminal.backend());
+}
+
+#[tokio::test]
+async fn status_line_multiline_footer_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    chat.show_welcome_banner = false;
+    chat.config.tui_status_line = Some(vec![
+        "model-with-reasoning".to_string(),
+        "context-remaining".to_string(),
+        "current-dir".to_string(),
+    ]);
+    chat.config.cwd = PathBuf::from("/repo");
+    chat.current_cwd = Some(PathBuf::from("/repo"));
+    chat.config.model_context_window = Some(272_000);
+    chat.config.model_auto_compact_token_limit = None;
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+    chat.set_token_info(Some(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 102_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 13_679,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(258_400),
+        model_full_context_window: None,
+        model_auto_compact_token_limit: None,
+    }));
+    chat.refresh_status_line();
+
+    let width = 100;
+    let height = chat.desired_height(width);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw multiline status line footer");
+    assert_snapshot!("status_line_multiline_footer", terminal.backend());
 }
 
 #[tokio::test]

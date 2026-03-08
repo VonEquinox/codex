@@ -307,6 +307,7 @@ const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
     ["model-with-reasoning", "context-remaining", "current-dir"];
+const STATUS_LINE_CONTEXT_BAR_SEGMENTS: usize = 8;
 // Track information about an in-flight exec command.
 struct RunningCommand {
     command: Vec<String>,
@@ -1033,7 +1034,7 @@ impl ChatWidget {
     }
 
     /// Sets the currently rendered footer status-line value.
-    pub(crate) fn set_status_line(&mut self, status_line: Option<Line<'static>>) {
+    pub(crate) fn set_status_line(&mut self, status_line: Option<Vec<Line<'static>>>) {
         self.bottom_pane.set_status_line(status_line);
     }
 
@@ -1086,19 +1087,51 @@ impl ChatWidget {
             self.request_status_line_branch(cwd);
         }
 
-        let mut parts = Vec::new();
+        let has_non_path_item = items.iter().any(|item| {
+            !matches!(
+                item,
+                StatusLineItem::CurrentDir | StatusLineItem::ProjectRoot
+            )
+        });
+        let mut primary_parts = Vec::new();
+        let mut path_parts = Vec::new();
         for item in items {
             if let Some(value) = self.status_line_value_for_item(&item) {
-                parts.push(value);
+                match item {
+                    StatusLineItem::CurrentDir | StatusLineItem::ProjectRoot
+                        if has_non_path_item =>
+                    {
+                        path_parts.push(value);
+                    }
+                    StatusLineItem::ModelName
+                    | StatusLineItem::ModelWithReasoning
+                    | StatusLineItem::GitBranch
+                    | StatusLineItem::ContextRemaining
+                    | StatusLineItem::ContextUsed
+                    | StatusLineItem::FiveHourLimit
+                    | StatusLineItem::WeeklyLimit
+                    | StatusLineItem::CodexVersion
+                    | StatusLineItem::ContextWindowSize
+                    | StatusLineItem::UsedTokens
+                    | StatusLineItem::TotalInputTokens
+                    | StatusLineItem::TotalOutputTokens
+                    | StatusLineItem::SessionId
+                    | StatusLineItem::FastMode
+                    | StatusLineItem::CurrentDir
+                    | StatusLineItem::ProjectRoot => primary_parts.push(value),
+                }
             }
         }
 
-        let line = if parts.is_empty() {
-            None
-        } else {
-            Some(Line::from(parts.join(" · ")))
-        };
-        self.set_status_line(line);
+        let mut lines = Vec::new();
+        if !primary_parts.is_empty() {
+            lines.push(Line::from(primary_parts.join(" · ")));
+        }
+        if !path_parts.is_empty() {
+            lines.push(Line::from(path_parts.join(" · ")));
+        }
+
+        self.set_status_line((!lines.is_empty()).then_some(lines));
     }
 
     /// Records that status-line setup was canceled.
@@ -5421,9 +5454,10 @@ impl ChatWidget {
                 .clamp(0.0, 100.0)
                 .round() as i64
         };
-        let filled = ((percent_remaining as f64 / 100.0) * 6.0).round() as usize;
-        let filled = filled.min(6);
-        let empty = 6usize.saturating_sub(filled);
+        let filled = ((percent_remaining as f64 / 100.0) * STATUS_LINE_CONTEXT_BAR_SEGMENTS as f64)
+            .round() as usize;
+        let filled = filled.min(STATUS_LINE_CONTEXT_BAR_SEGMENTS);
+        let empty = STATUS_LINE_CONTEXT_BAR_SEGMENTS.saturating_sub(filled);
         format!(
             "{label} [{}{}] {}",
             "█".repeat(filled),

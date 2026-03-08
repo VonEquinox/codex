@@ -168,11 +168,14 @@ use super::footer::footer_line_width;
 use super::footer::inset_footer_hint_area;
 use super::footer::max_left_width_for_right;
 use super::footer::render_context_right;
+use super::footer::render_context_right_on_row;
 use super::footer::render_footer_from_props;
 use super::footer::render_footer_hint_items;
 use super::footer::render_footer_line;
+use super::footer::render_footer_lines;
 use super::footer::reset_mode_after_activity;
 use super::footer::single_line_footer_layout;
+use super::footer::status_line_is_active;
 use super::footer::toggle_shortcut_mode;
 use super::paste_burst::CharDecision;
 use super::paste_burst::PasteBurst;
@@ -410,7 +413,7 @@ pub(crate) struct ChatComposer {
     realtime_conversation_enabled: bool,
     audio_device_selection_enabled: bool,
     windows_degraded_sandbox_active: bool,
-    status_line_value: Option<Line<'static>>,
+    status_line_value: Option<Vec<Line<'static>>>,
     status_line_enabled: bool,
 }
 
@@ -1129,11 +1132,17 @@ impl ChatComposer {
 
     #[cfg(test)]
     pub(crate) fn status_line_text(&self) -> Option<String> {
-        self.status_line_value.as_ref().map(|line| {
-            line.spans
+        self.status_line_value.as_ref().map(|lines| {
+            lines
                 .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         })
     }
 
@@ -3780,7 +3789,7 @@ impl ChatComposer {
         }
     }
 
-    pub(crate) fn set_status_line(&mut self, status_line: Option<Line<'static>>) -> bool {
+    pub(crate) fn set_status_line(&mut self, status_line: Option<Vec<Line<'static>>>) -> bool {
         if self.status_line_value == status_line {
             return false;
         }
@@ -4228,26 +4237,39 @@ impl ChatComposer {
                 };
                 let available_width =
                     hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
-                let status_line = footer_props
-                    .status_line_value
-                    .as_ref()
-                    .map(|line| line.clone().dim());
-                let status_line_candidate = footer_props.status_line_enabled
-                    && match footer_props.mode {
-                        FooterMode::ComposerEmpty => true,
-                        FooterMode::ComposerHasDraft => !footer_props.is_task_running,
-                        FooterMode::QuitShortcutReminder
-                        | FooterMode::ShortcutOverlay
-                        | FooterMode::EscHint => false,
-                    };
-                let mut truncated_status_line = if status_line_candidate {
-                    status_line.as_ref().map(|line| {
-                        truncate_line_with_ellipsis_if_overflow(line.clone(), available_width)
+                let status_line = footer_props.status_line_value.as_ref().map(|lines| {
+                    lines
+                        .iter()
+                        .cloned()
+                        .map(ratatui::prelude::Stylize::dim)
+                        .collect::<Vec<_>>()
+                });
+                let status_line_candidate =
+                    status_line_is_active(&footer_props) && status_line.is_some();
+                let build_status_line = |first_line_width: Option<usize>| {
+                    status_line.as_ref().map(|lines| {
+                        let mut truncated = lines
+                            .iter()
+                            .cloned()
+                            .map(|line| {
+                                truncate_line_with_ellipsis_if_overflow(line, available_width)
+                            })
+                            .collect::<Vec<_>>();
+                        if let Some(width) = first_line_width
+                            && let Some(first_line) = truncated.first_mut()
+                        {
+                            *first_line =
+                                truncate_line_with_ellipsis_if_overflow(first_line.clone(), width);
+                        }
+                        truncated
                     })
+                };
+                let mut truncated_status_line = if status_line_candidate {
+                    build_status_line(None)
                 } else {
                     None
                 };
-                let status_line_active = status_line_candidate && truncated_status_line.is_some();
+                let status_line_active = status_line_candidate;
                 let left_mode_indicator = if status_line_active {
                     None
                 } else {
@@ -4263,6 +4285,7 @@ impl ChatComposer {
                 } else if status_line_active {
                     truncated_status_line
                         .as_ref()
+                        .and_then(|lines| lines.first())
                         .map(|line| line.width() as u16)
                         .unwrap_or(0)
                 } else {
@@ -4284,6 +4307,8 @@ impl ChatComposer {
                     } else {
                         compact
                     }
+                } else if status_line_candidate {
+                    None
                 } else {
                     Some(context_window_line(footer_props.context_window))
                 };
@@ -4291,18 +4316,17 @@ impl ChatComposer {
                 if status_line_active
                     && let Some(max_left) = max_left_width_for_right(hint_rect, right_width)
                     && left_width > max_left
-                    && let Some(line) = status_line.as_ref().map(|line| {
-                        truncate_line_with_ellipsis_if_overflow(line.clone(), max_left as usize)
-                    })
+                    && let Some(lines) = build_status_line(Some(max_left as usize))
+                    && let Some(line) = lines.first()
                 {
                     left_width = line.width() as u16;
-                    truncated_status_line = Some(line);
+                    truncated_status_line = Some(lines);
                 }
                 let can_show_left_and_context =
                     can_show_left_with_context(hint_rect, left_width, right_width);
                 let has_override =
                     self.footer_flash_visible() || self.footer_hint_override.is_some();
-                let single_line_layout = if has_override || status_line_active {
+                let single_line_layout = if has_override || status_line_candidate {
                     None
                 } else {
                     match footer_props.mode {
@@ -4343,8 +4367,8 @@ impl ChatComposer {
                     match summary_left {
                         SummaryLeft::Default => {
                             if status_line_active {
-                                if let Some(line) = truncated_status_line.clone() {
-                                    render_footer_line(hint_rect, buf, line);
+                                if let Some(lines) = truncated_status_line.clone() {
+                                    render_footer_lines(hint_rect, buf, lines);
                                 } else {
                                     render_footer_from_props(
                                         hint_rect,
@@ -4380,8 +4404,8 @@ impl ChatComposer {
                 } else if let Some(items) = self.footer_hint_override.as_ref() {
                     render_footer_hint_items(hint_rect, buf, items);
                 } else if status_line_active {
-                    if let Some(line) = truncated_status_line {
-                        render_footer_line(hint_rect, buf, line);
+                    if let Some(lines) = truncated_status_line {
+                        render_footer_lines(hint_rect, buf, lines);
                     }
                 } else {
                     render_footer_from_props(
@@ -4396,7 +4420,11 @@ impl ChatComposer {
                 }
 
                 if show_right && let Some(line) = &right_line {
-                    render_context_right(hint_rect, buf, line);
+                    if status_line_active {
+                        render_context_right_on_row(hint_rect, buf, line, 0);
+                    } else {
+                        render_context_right(hint_rect, buf, line);
+                    }
                 }
             }
         }
