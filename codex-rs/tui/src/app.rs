@@ -26,9 +26,12 @@ use crate::history_cell::UpdateAvailableHistoryCell;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
+use crate::multi_agents::AgentPickerBadge;
 use crate::multi_agents::AgentPickerThreadEntry;
+use crate::multi_agents::agent_picker_badge_from_status;
 use crate::multi_agents::agent_picker_status_dot_spans;
 use crate::multi_agents::format_agent_picker_item_name;
+use crate::multi_agents::format_agent_picker_list_item_name;
 use crate::multi_agents::sort_agent_picker_threads;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
@@ -1148,6 +1151,7 @@ impl App {
             guard.push_event(event.clone());
             guard.active
         };
+        self.update_agent_picker_thread_badge_from_event(thread_id, &event.msg);
 
         if should_send {
             // Never await a bounded channel send on the main TUI loop: if the receiver falls behind,
@@ -1224,12 +1228,15 @@ impl App {
         for thread_id in thread_ids {
             match self.server.get_thread(thread_id).await {
                 Ok(thread) => {
-                    let session_source = thread.config_snapshot().await.session_source;
+                    let config_snapshot = thread.config_snapshot().await;
+                    let session_source = config_snapshot.session_source;
+                    let badge = agent_picker_badge_from_status(&thread.agent_status().await);
                     self.upsert_agent_picker_thread(
                         thread_id,
                         session_source.get_nickname(),
                         session_source.get_agent_role(),
                         false,
+                        badge,
                     );
                 }
                 Err(_) => {
@@ -1270,9 +1277,10 @@ impl App {
                 }
                 let id = *thread_id;
                 let is_primary = self.primary_thread_id == Some(*thread_id);
-                let name = format_agent_picker_item_name(
+                let name = format_agent_picker_list_item_name(
                     entry.agent_nickname.as_deref(),
                     entry.agent_role.as_deref(),
+                    entry.badge,
                     is_primary,
                 );
                 let uuid = thread_id.to_string();
@@ -1307,6 +1315,7 @@ impl App {
         agent_nickname: Option<String>,
         agent_role: Option<String>,
         is_closed: bool,
+        badge: AgentPickerBadge,
     ) {
         self.agent_picker_threads.insert(
             thread_id,
@@ -1314,6 +1323,7 @@ impl App {
                 agent_nickname,
                 agent_role,
                 is_closed,
+                badge,
             },
         );
     }
@@ -1322,7 +1332,24 @@ impl App {
         if let Some(entry) = self.agent_picker_threads.get_mut(&thread_id) {
             entry.is_closed = true;
         } else {
-            self.upsert_agent_picker_thread(thread_id, None, None, true);
+            self.upsert_agent_picker_thread(thread_id, None, None, true, AgentPickerBadge::None);
+        }
+    }
+
+    fn update_agent_picker_thread_badge_from_event(&mut self, thread_id: ThreadId, msg: &EventMsg) {
+        let badge = match msg {
+            EventMsg::TurnStarted(_) => Some(AgentPickerBadge::Working),
+            EventMsg::TurnComplete(_) => Some(AgentPickerBadge::Finish),
+            EventMsg::TurnAborted(_) | EventMsg::Error(_) => Some(AgentPickerBadge::Error),
+            _ => None,
+        };
+        let Some(badge) = badge else {
+            return;
+        };
+        let entry = self.agent_picker_threads.entry(thread_id).or_default();
+        entry.badge = badge;
+        if matches!(badge, AgentPickerBadge::Working) {
+            entry.is_closed = false;
         }
     }
 
@@ -3341,6 +3368,9 @@ impl App {
     /// thread shutdowns fail over to the primary thread, while user-requested
     /// app exits consume only the tracked shutdown completion and then proceed.
     async fn handle_active_thread_event(&mut self, tui: &mut tui::Tui, event: Event) -> Result<()> {
+        if let Some(active_thread_id) = self.active_thread_id {
+            self.update_agent_picker_thread_badge_from_event(active_thread_id, &event.msg);
+        }
         // Capture this before any potential thread switch: we only want to clear
         // the exit marker when the currently active thread acknowledges shutdown.
         let pending_shutdown_exit_completed = matches!(&event.msg, EventMsg::ShutdownComplete)
@@ -3399,11 +3429,13 @@ impl App {
             }
         };
         let config_snapshot = thread.config_snapshot().await;
+        let badge = agent_picker_badge_from_status(&thread.agent_status().await);
         self.upsert_agent_picker_thread(
             thread_id,
             config_snapshot.session_source.get_nickname(),
             config_snapshot.session_source.get_agent_role(),
             false,
+            badge,
         );
         let event = Event {
             id: String::new(),
@@ -4814,6 +4846,7 @@ mod tests {
                 agent_nickname: None,
                 agent_role: None,
                 is_closed: true,
+                badge: AgentPickerBadge::None,
             })
         );
         Ok(())
@@ -4831,6 +4864,7 @@ mod tests {
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
                 is_closed: false,
+                badge: AgentPickerBadge::Finish,
             },
         );
 
@@ -4843,6 +4877,132 @@ mod tests {
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
                 is_closed: true,
+                badge: AgentPickerBadge::Finish,
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_updates_agent_picker_badges() -> Result<()> {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.thread_event_channels
+            .insert(thread_id, ThreadEventChannel::new(1));
+        app.agent_picker_threads.insert(
+            thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                is_closed: true,
+                badge: AgentPickerBadge::Finish,
+            },
+        );
+
+        app.enqueue_thread_event(
+            thread_id,
+            Event {
+                id: "turn-started".to_string(),
+                msg: EventMsg::TurnStarted(TurnStartedEvent {
+                    turn_id: "turn-1".to_string(),
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                }),
+            },
+        )
+        .await?;
+        assert_eq!(
+            app.agent_picker_threads
+                .get(&thread_id)
+                .map(|entry| entry.badge),
+            Some(AgentPickerBadge::Working)
+        );
+        assert_eq!(
+            app.agent_picker_threads
+                .get(&thread_id)
+                .map(|entry| entry.is_closed),
+            Some(false)
+        );
+
+        app.enqueue_thread_event(
+            thread_id,
+            Event {
+                id: "turn-complete".to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: "turn-1".to_string(),
+                    last_agent_message: Some("done".to_string()),
+                }),
+            },
+        )
+        .await?;
+        assert_eq!(
+            app.agent_picker_threads
+                .get(&thread_id)
+                .map(|entry| entry.badge),
+            Some(AgentPickerBadge::Finish)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_turn_aborted_marks_agent_picker_error_badge() -> Result<()> {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.thread_event_channels
+            .insert(thread_id, ThreadEventChannel::new(1));
+
+        app.enqueue_thread_event(
+            thread_id,
+            Event {
+                id: "turn-aborted".to_string(),
+                msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id: Some("turn-1".to_string()),
+                    reason: TurnAbortReason::Interrupted,
+                }),
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            app.agent_picker_threads.get(&thread_id),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: None,
+                agent_role: None,
+                is_closed: false,
+                badge: AgentPickerBadge::Error,
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_agent_picker_refreshes_badge_from_live_status() -> Result<()> {
+        let mut app = make_test_app().await;
+        let config = app.chat_widget.config_ref().clone();
+        let thread = app.server.start_thread(config).await.expect("start thread");
+        let thread_id = thread.thread_id;
+        app.thread_event_channels
+            .insert(thread_id, ThreadEventChannel::new(1));
+        app.agent_picker_threads.insert(
+            thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                is_closed: false,
+                badge: AgentPickerBadge::Finish,
+            },
+        );
+
+        app.open_agent_picker().await;
+
+        assert_eq!(
+            app.agent_picker_threads.get(&thread_id),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: None,
+                agent_role: None,
+                is_closed: false,
+                badge: AgentPickerBadge::None,
             })
         );
         Ok(())
@@ -4937,6 +5097,7 @@ mod tests {
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
                 is_closed: false,
+                badge: AgentPickerBadge::None,
             },
         );
 
@@ -4995,6 +5156,7 @@ mod tests {
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
                 is_closed: false,
+                badge: AgentPickerBadge::None,
             },
         );
 
@@ -5038,27 +5200,47 @@ mod tests {
         let snapshot = [
             format!(
                 "{} | {}",
-                format_agent_picker_item_name(Some("Robie"), Some("explorer"), true),
+                format_agent_picker_list_item_name(
+                    Some("Robie"),
+                    Some("explorer"),
+                    AgentPickerBadge::Working,
+                    true,
+                ),
                 thread_id
             ),
             format!(
                 "{} | {}",
-                format_agent_picker_item_name(Some("Robie"), Some("explorer"), false),
+                format_agent_picker_list_item_name(
+                    Some("Robie"),
+                    Some("explorer"),
+                    AgentPickerBadge::Working,
+                    false,
+                ),
                 thread_id
             ),
             format!(
                 "{} | {}",
-                format_agent_picker_item_name(Some("Robie"), None, false),
+                format_agent_picker_list_item_name(
+                    Some("Robie"),
+                    None,
+                    AgentPickerBadge::Finish,
+                    false,
+                ),
                 thread_id
             ),
             format!(
                 "{} | {}",
-                format_agent_picker_item_name(None, Some("explorer"), false),
+                format_agent_picker_list_item_name(
+                    None,
+                    Some("explorer"),
+                    AgentPickerBadge::Error,
+                    false,
+                ),
                 thread_id
             ),
             format!(
                 "{} | {}",
-                format_agent_picker_item_name(None, None, false),
+                format_agent_picker_list_item_name(None, None, AgentPickerBadge::None, false,),
                 thread_id
             ),
         ]

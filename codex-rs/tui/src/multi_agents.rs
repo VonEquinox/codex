@@ -22,11 +22,43 @@ const COLLAB_PROMPT_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_RESPONSE_PREVIEW_GRAPHEMES: usize = 240;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AgentPickerBadge {
+    #[default]
+    None,
+    Working,
+    Finish,
+    Error,
+}
+
+impl AgentPickerBadge {
+    fn suffix(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Working => Some("[working]"),
+            Self::Finish => Some("[finish]"),
+            Self::Error => Some("[error]"),
+        }
+    }
+}
+
+pub(crate) fn agent_picker_badge_from_status(status: &AgentStatus) -> AgentPickerBadge {
+    match status {
+        AgentStatus::Running => AgentPickerBadge::Working,
+        AgentStatus::Completed(_) => AgentPickerBadge::Finish,
+        AgentStatus::Errored(_) => AgentPickerBadge::Error,
+        AgentStatus::PendingInit | AgentStatus::Shutdown | AgentStatus::NotFound => {
+            AgentPickerBadge::None
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct AgentPickerThreadEntry {
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
     pub(crate) is_closed: bool,
+    pub(crate) badge: AgentPickerBadge,
 }
 
 #[derive(Clone, Copy)]
@@ -64,6 +96,20 @@ pub(crate) fn format_agent_picker_item_name(
         (None, Some(agent_role)) => format!("[{agent_role}]"),
         (None, None) => "Agent".to_string(),
     }
+}
+
+pub(crate) fn format_agent_picker_list_item_name(
+    agent_nickname: Option<&str>,
+    agent_role: Option<&str>,
+    badge: AgentPickerBadge,
+    is_primary: bool,
+) -> String {
+    let mut label = format_agent_picker_item_name(agent_nickname, agent_role, is_primary);
+    if !is_primary && let Some(suffix) = badge.suffix() {
+        label.push(' ');
+        label.push_str(suffix);
+    }
+    label
 }
 
 pub(crate) fn sort_agent_picker_threads(agent_threads: &mut [(ThreadId, AgentPickerThreadEntry)]) {
