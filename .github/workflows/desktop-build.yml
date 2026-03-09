@@ -1,0 +1,61 @@
+name: desktop-build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: codex.exe
+            packaged_name: codex-x86_64-pc-windows-msvc.exe
+          - label: macos-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            binary_name: codex
+            packaged_name: codex-aarch64-apple-darwin
+          - label: macos-x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            binary_name: codex
+            packaged_name: codex-x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release -p codex-cli --bin codex --target "${{ matrix.target }}"
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "dist/${{ matrix.packaged_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: codex-rs/dist/${{ matrix.packaged_name }}
+          if-no-files-found: error
