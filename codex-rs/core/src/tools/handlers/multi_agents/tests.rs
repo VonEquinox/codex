@@ -810,6 +810,160 @@ async fn spawn_agent_worktree_hooks_override_git_worktree_lifecycle() {
 }
 
 #[tokio::test]
+async fn close_agent_preserves_hook_worktree_lease_when_remove_hook_fails() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let cwd = tempfile::tempdir().expect("temp dir");
+    turn.cwd = cwd.path().to_path_buf();
+
+    std::fs::create_dir_all(&turn.config.codex_home).expect("create codex_home");
+
+    let hook_worktree = turn.config.codex_home.join("hook-worktree-retry");
+    let marker_path = turn.config.codex_home.join("worktree-remove-failure.log");
+    let create_script = r#"import sys, json, pathlib; data=json.load(sys.stdin); path=pathlib.Path(sys.argv[1]); path.mkdir(parents=True, exist_ok=True); open(sys.argv[2], "a").write(data["hook_event_name"] + "\n"); print(path)"#;
+    let fail_remove_script = r#"import sys; sys.stderr.write("remove denied"); sys.exit(2)"#;
+    session.services.hooks = Hooks::new(HooksConfig {
+        command_hooks: CommandHooksConfig {
+            worktree_create: vec![CommandHookConfig {
+                name: Some("create-hook".to_string()),
+                command: vec![
+                    "python3".to_string(),
+                    "-c".to_string(),
+                    create_script.to_string(),
+                    hook_worktree.to_string_lossy().into_owned(),
+                    marker_path.to_string_lossy().into_owned(),
+                ],
+                ..Default::default()
+            }],
+            worktree_remove: vec![CommandHookConfig {
+                name: Some("remove-hook".to_string()),
+                command: vec![
+                    "python3".to_string(),
+                    "-c".to_string(),
+                    fail_remove_script.to_string(),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    });
+
+    let mut session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let spawn_output = MultiAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "worktree": true
+            })),
+        ))
+        .await
+        .expect("spawn_agent should succeed with hook worktree");
+    let ToolOutput::Function {
+        body: FunctionCallOutputBody::Text(spawn_content),
+        ..
+    } = spawn_output
+    else {
+        panic!("expected function output");
+    };
+    let spawn_result: SpawnAgentResult =
+        serde_json::from_str(&spawn_content).expect("spawn_agent result should be json");
+    let agent_id = agent_id(&spawn_result.agent_id).expect("valid agent id");
+    let lease_path = worktree_lease_path(turn.config.codex_home.as_path(), agent_id);
+    assert_eq!(tokio::fs::metadata(&lease_path).await.is_ok(), true);
+
+    let Err(err) = MultiAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "close_agent",
+            function_payload(json!({
+                "id": agent_id.to_string()
+            })),
+        ))
+        .await
+    else {
+        panic!("close_agent should surface worktree_remove hook failure");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "worktree_remove hook 'remove-hook' failed: remove denied".to_string()
+        )
+    );
+    assert_eq!(tokio::fs::metadata(&lease_path).await.is_ok(), true);
+    assert_eq!(tokio::fs::metadata(&hook_worktree).await.is_ok(), true);
+
+    let persisted_raw = tokio::fs::read_to_string(&lease_path)
+        .await
+        .expect("failed cleanup should leave persisted lease behind");
+    let persisted: PersistedWorktreeLease =
+        serde_json::from_str(&persisted_raw).expect("persisted lease should be valid json");
+    assert_eq!(persisted.worktree_path, hook_worktree);
+    assert_eq!(persisted.created_via_hook, true);
+
+    {
+        let registry = worktree_leases()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let restored = registry
+            .get(&agent_id)
+            .cloned()
+            .expect("failed cleanup should restore lease to registry");
+        assert_eq!(restored.worktree_path, hook_worktree);
+        assert_eq!(restored.created_via_hook, true);
+    }
+
+    let remove_script = r#"import sys, json, pathlib, shutil; data=json.load(sys.stdin); path=pathlib.Path(data["worktree_path"]); shutil.rmtree(path, ignore_errors=True); open(sys.argv[1], "a").write(data["hook_event_name"] + "\n")"#;
+    Arc::get_mut(&mut session)
+        .expect("session should be unique")
+        .services
+        .hooks = Hooks::new(HooksConfig {
+        command_hooks: CommandHooksConfig {
+            worktree_remove: vec![CommandHookConfig {
+                name: Some("remove-hook".to_string()),
+                command: vec![
+                    "python3".to_string(),
+                    "-c".to_string(),
+                    remove_script.to_string(),
+                    marker_path.to_string_lossy().into_owned(),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    });
+
+    MultiAgentHandler
+        .handle(invocation(
+            session,
+            turn,
+            "close_agent",
+            function_payload(json!({
+                "id": agent_id.to_string()
+            })),
+        ))
+        .await
+        .expect("close_agent retry should succeed after hook is fixed");
+
+    assert_eq!(tokio::fs::metadata(&lease_path).await.is_err(), true);
+    assert_eq!(tokio::fs::metadata(&hook_worktree).await.is_err(), true);
+    let hook_events = tokio::fs::read_to_string(&marker_path)
+        .await
+        .expect("hooks should write markers");
+    assert_eq!(hook_events, "WorktreeCreate\nWorktreeRemove\n");
+}
+
+#[tokio::test]
 async fn spawn_agent_rejects_unknown_model_provider_override() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
@@ -1923,6 +2077,142 @@ async fn spawn_agent_reaps_shutdown_agent_on_thread_limit() {
 }
 
 #[tokio::test]
+async fn spawn_agent_fork_context_survives_limit_retry() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let mut config = (*turn.config).clone();
+    config.agent_max_threads = Some(1);
+    turn.config = Arc::new(config);
+    let parent_thread = manager
+        .start_thread(turn.config.as_ref().clone())
+        .await
+        .expect("start parent thread");
+    let parent_thread_id = parent_thread.thread_id;
+    session.conversation_id = parent_thread_id;
+
+    let parent_spawn_call = ResponseItem::FunctionCall {
+        id: None,
+        name: "spawn_agent".to_string(),
+        arguments: "{}".to_string(),
+        call_id: "call-1".to_string(),
+    };
+    let parent_turn = parent_thread.thread.codex.session.new_default_turn().await;
+    parent_thread
+        .thread
+        .codex
+        .session
+        .record_conversation_items(parent_turn.as_ref(), &[parent_spawn_call])
+        .await;
+    parent_thread
+        .thread
+        .codex
+        .session
+        .ensure_rollout_materialized()
+        .await;
+    parent_thread.thread.codex.session.flush_rollout().await;
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let first_spawn = MultiAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({"message": "hello"})),
+        ))
+        .await
+        .expect("initial spawn_agent should succeed");
+    let ToolOutput::Function {
+        body: FunctionCallOutputBody::Text(first_spawn_content),
+        ..
+    } = first_spawn
+    else {
+        panic!("expected function output");
+    };
+    let first_spawn_result: SpawnAgentResult =
+        serde_json::from_str(&first_spawn_content).expect("spawn_agent result should be json");
+    let first_thread_id = agent_id(&first_spawn_result.agent_id).expect("valid agent id");
+
+    let thread = manager
+        .get_thread(first_thread_id)
+        .await
+        .expect("spawned agent should exist");
+    let _ = thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                manager.agent_control().get_status(first_thread_id).await,
+                AgentStatus::Shutdown
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("agent should reach shutdown");
+
+    let forked_spawn = MultiAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "fork this work",
+                "fork_context": true
+            })),
+        ))
+        .await
+        .expect("forked spawn_agent should succeed by reaping shutdown agent");
+    let ToolOutput::Function {
+        body: FunctionCallOutputBody::Text(forked_spawn_content),
+        ..
+    } = forked_spawn
+    else {
+        panic!("expected function output");
+    };
+    let forked_spawn_result: SpawnAgentResult =
+        serde_json::from_str(&forked_spawn_content).expect("spawn_agent result should be json");
+    let second_thread_id = agent_id(&forked_spawn_result.agent_id).expect("valid agent id");
+    assert_eq!(second_thread_id == first_thread_id, false);
+
+    let history = manager
+        .get_thread(second_thread_id)
+        .await
+        .expect("forked agent should exist")
+        .codex
+        .session
+        .clone_history()
+        .await;
+    let fork_output = history.raw_items().iter().find_map(|item| match item {
+        ResponseItem::FunctionCallOutput { call_id, output } if call_id == "call-1" => Some(output),
+        _ => None,
+    });
+    let fork_output = fork_output.expect("forked retry should preserve synthetic parent output");
+    assert_eq!(fork_output.success, Some(true));
+
+    let _ = manager
+        .agent_control()
+        .shutdown_agent(second_thread_id)
+        .await;
+    let _ = parent_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("parent shutdown should submit");
+}
+
+#[tokio::test]
 async fn spawn_team_reaps_shutdown_agent_on_thread_limit() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
@@ -2025,6 +2315,54 @@ async fn spawn_team_reaps_shutdown_agent_on_thread_limit() {
         .agent_control()
         .shutdown_agent(member_thread_id)
         .await;
+}
+
+#[tokio::test]
+async fn spawn_team_rejects_unknown_agent_type_and_cleans_up_members() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let Err(err) = MultiAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_team",
+            function_payload(json!({
+                "team_id": "invalid-role-team",
+                "members": [
+                    {"name": "planner", "task": "plan"},
+                    {"name": "reviewer", "task": "review", "agent_type": "missing-role"}
+                ]
+            })),
+        ))
+        .await
+    else {
+        panic!("spawn_team should reject unknown agent_type");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel("unknown agent_type 'missing-role'".to_string())
+    );
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .spawned_thread_ids()
+            .is_empty(),
+        true
+    );
+    assert_eq!(
+        tokio::fs::metadata(team_config_path(
+            turn.config.codex_home.as_path(),
+            "invalid-role-team",
+        ))
+        .await
+        .is_err(),
+        true
+    );
 }
 
 #[tokio::test]
@@ -3744,11 +4082,17 @@ async fn wait_team_any_returns_triggered_member() {
 
 #[tokio::test]
 async fn wait_team_returns_hook_block_for_teammate_idle() {
-    let (mut session, turn) = make_session_and_context().await;
+    let (mut session, turn, rx) = make_session_and_context_with_rx().await;
     let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
+    Arc::get_mut(&mut session)
+        .expect("session should be unique")
+        .services
+        .agent_control = manager.agent_control();
     let block_script = r#"import sys; sys.stderr.write("blocked teammate"); sys.exit(2)"#;
-    session.services.hooks = Hooks::new(HooksConfig {
+    Arc::get_mut(&mut session)
+        .expect("session should be unique")
+        .services
+        .hooks = Hooks::new(HooksConfig {
         command_hooks: CommandHooksConfig {
             teammate_idle: vec![CommandHookConfig {
                 name: Some("idle-guard".to_string()),
@@ -3762,8 +4106,6 @@ async fn wait_team_returns_hook_block_for_teammate_idle() {
             ..Default::default()
         },
     });
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
 
     let spawn_output = MultiAgentHandler
         .handle(invocation(
@@ -3816,6 +4158,33 @@ async fn wait_team_returns_hook_block_for_teammate_idle() {
             "teammate_idle hook 'idle-guard' blocked: blocked teammate".to_string()
         )
     );
+
+    let mut saw_wait_begin = false;
+    let mut saw_wait_end = false;
+    let _ = timeout(Duration::from_millis(250), async {
+        loop {
+            let Ok(event) = rx.recv().await else {
+                break;
+            };
+            match event.msg {
+                codex_protocol::protocol::EventMsg::CollabWaitingBegin(ev)
+                    if ev.call_id == "team/wait:call-1" =>
+                {
+                    saw_wait_begin = true;
+                }
+                codex_protocol::protocol::EventMsg::CollabWaitingEnd(ev)
+                    if ev.call_id == "team/wait:call-1" =>
+                {
+                    saw_wait_end = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert_eq!(saw_wait_begin, true);
+    assert_eq!(saw_wait_end, false);
 }
 
 #[tokio::test]

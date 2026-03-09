@@ -1439,6 +1439,7 @@ impl App {
     fn mark_agent_picker_thread_closed(&mut self, thread_id: ThreadId) {
         if let Some(entry) = self.agent_picker_threads.get_mut(&thread_id) {
             entry.is_closed = true;
+            entry.badge = AgentPickerBadge::None;
         } else {
             self.upsert_agent_picker_thread(thread_id, None, None, true, AgentPickerBadge::None);
         }
@@ -5187,7 +5188,35 @@ mod tests {
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
                 is_closed: true,
-                badge: AgentPickerBadge::Finish,
+                badge: AgentPickerBadge::None,
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_agent_picker_thread_closed_clears_stale_badge() -> Result<()> {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.agent_picker_threads.insert(
+            thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                is_closed: false,
+                badge: AgentPickerBadge::Error,
+            },
+        );
+
+        app.mark_agent_picker_thread_closed(thread_id);
+
+        assert_eq!(
+            app.agent_picker_threads.get(&thread_id),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                is_closed: true,
+                badge: AgentPickerBadge::None,
             })
         );
         Ok(())

@@ -4473,8 +4473,8 @@ experimental_realtime_ws_model = "realtime-test-model"
 }
 
 #[test]
-fn translation_loads_custom_provider_from_config_toml_when_feature_enabled() -> std::io::Result<()>
-{
+fn translation_loads_custom_provider_with_env_key_from_config_toml_when_feature_enabled()
+-> std::io::Result<()> {
     let cfg: ConfigToml = toml::from_str(
         r#"
 [features]
@@ -4487,6 +4487,7 @@ model = "translator-model"
 [model_providers.translator]
 name = "Translator"
 base_url = "https://translator.example/v1"
+env_key = "TRANSLATOR_API_KEY"
 wire_api = "responses"
 "#,
     )
@@ -4513,6 +4514,10 @@ wire_api = "responses"
     assert_eq!(
         translation.provider.base_url.as_deref(),
         Some("https://translator.example/v1")
+    );
+    assert_eq!(
+        translation.provider.env_key.as_deref(),
+        Some("TRANSLATOR_API_KEY")
     );
     Ok(())
 }
@@ -4648,8 +4653,8 @@ model = "translator-model"
 }
 
 #[test]
-fn translation_loads_builtin_provider_from_config_toml_when_feature_enabled() -> std::io::Result<()>
-{
+fn translation_builtin_openai_provider_without_explicit_credentials_is_disabled()
+-> std::io::Result<()> {
     let cfg: ConfigToml = toml::from_str(
         r#"
 [features]
@@ -4677,13 +4682,47 @@ model = "translator-model"
         codex_home.path().to_path_buf(),
     )?;
 
-    assert_eq!(
-        config.translation,
-        Some(TranslationConfig {
-            provider_id: "openai".to_string(),
-            provider: built_in_model_providers()["openai"].clone(),
-            model: "translator-model".to_string(),
-        })
+    assert_eq!(config.translation, None);
+    assert_eq!(config.startup_warnings.len(), 1);
+    assert!(
+        config.startup_warnings[0]
+            .contains("translation provider `openai` has no explicit credential source")
+    );
+    Ok(())
+}
+
+#[test]
+fn translation_provider_with_blank_inline_api_key_is_disabled() -> std::io::Result<()> {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[features]
+reasoning_summary_translation = true
+
+[translation]
+provider = "translator"
+model = "translator-model"
+
+[model_providers.translator]
+name = "Translator"
+base_url = "https://translator.example/v1"
+api_key = "   "
+wire_api = "responses"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(config.translation, None);
+    assert_eq!(config.startup_warnings.len(), 1);
+    assert!(
+        config.startup_warnings[0]
+            .contains("translation provider `translator` has no explicit credential source")
     );
     Ok(())
 }

@@ -42,16 +42,21 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use wiremock::Mock;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
-fn enable_reasoning_summary_translation(config: &mut codex_core::config::Config, base_url: String) {
+fn configure_reasoning_summary_translation(
+    config: &mut codex_core::config::Config,
+    base_url: String,
+    api_key: Option<&str>,
+) {
     let mut translation_provider: ModelProviderInfo = built_in_model_providers()["openai"].clone();
     translation_provider.name = "Translator".to_string();
     translation_provider.base_url = Some(format!("{base_url}/v1"));
     translation_provider.env_key = None;
     translation_provider.env_key_instructions = None;
-    translation_provider.experimental_bearer_token = None;
+    translation_provider.experimental_bearer_token = api_key.map(std::string::ToString::to_string);
     translation_provider.request_max_retries = Some(0);
     translation_provider.requires_openai_auth = false;
     translation_provider.supports_websockets = false;
@@ -1109,6 +1114,7 @@ async fn reasoning_summary_translation_keeps_canonical_items_raw_and_translates_
     let translation_server = start_mock_server().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer translator-inline-key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "output": [
                 {
@@ -1130,7 +1136,11 @@ async fn reasoning_summary_translation_keeps_canonical_items_raw_and_translates_
     let translation_base_url = translation_server.uri();
     let TestCodex { codex, .. } = test_codex()
         .with_config(move |config| {
-            enable_reasoning_summary_translation(config, translation_base_url);
+            configure_reasoning_summary_translation(
+                config,
+                translation_base_url,
+                Some("translator-inline-key"),
+            );
         })
         .build(&server)
         .await?;
@@ -1173,7 +1183,7 @@ async fn reasoning_summary_translation_keeps_canonical_items_raw_and_translates_
     })
     .await;
 
-    assert_eq!(delta_event.delta, "step one");
+    assert_eq!(delta_event.delta, "第一步");
     assert_eq!(legacy_delta.delta, "第一步");
     assert_eq!(completed_item.summary_text, vec!["step one".to_string()]);
 
@@ -1202,6 +1212,7 @@ async fn reasoning_summary_translation_falls_back_to_original_text_on_failure() 
     let translation_server = start_mock_server().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer translator-inline-key"))
         .respond_with(ResponseTemplate::new(500))
         .expect(1)
         .mount(&translation_server)
@@ -1210,7 +1221,11 @@ async fn reasoning_summary_translation_falls_back_to_original_text_on_failure() 
     let translation_base_url = translation_server.uri();
     let TestCodex { codex, .. } = test_codex()
         .with_config(move |config| {
-            enable_reasoning_summary_translation(config, translation_base_url);
+            configure_reasoning_summary_translation(
+                config,
+                translation_base_url,
+                Some("translator-inline-key"),
+            );
         })
         .build(&server)
         .await?;
@@ -1256,6 +1271,85 @@ async fn reasoning_summary_translation_falls_back_to_original_text_on_failure() 
     assert_eq!(delta_event.delta, "step one");
     assert_eq!(legacy_delta.delta, "step one");
     assert_eq!(completed_item.summary_text, vec!["step one".to_string()]);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_summary_translation_does_not_fallback_to_session_auth_without_provider_credentials()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let translation_server = start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "第一步"
+                        }
+                    ]
+                }
+            ]
+        })))
+        .expect(0)
+        .mount(&translation_server)
+        .await;
+
+    let translation_base_url = translation_server.uri();
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(move |config| {
+            configure_reasoning_summary_translation(config, translation_base_url, None);
+        })
+        .build(&server)
+        .await?;
+
+    let stream = sse(vec![
+        ev_response_created("resp-1"),
+        ev_reasoning_item_added("reasoning-1", &[""]),
+        ev_reasoning_summary_text_delta("step one"),
+        ev_reasoning_item("reasoning-1", &["step one"], &[]),
+        ev_completed("resp-1"),
+    ]);
+    mount_sse_once(&server, stream).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "translate reasoning".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+
+    let delta_event = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ReasoningContentDelta(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    let legacy_delta = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::AgentReasoningDelta(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(delta_event.delta, "step one");
+    assert_eq!(legacy_delta.delta, "step one");
+    assert_eq!(
+        translation_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len(),
+        0
+    );
 
     Ok(())
 }

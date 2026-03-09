@@ -118,6 +118,13 @@ pub struct ModelProviderInfo {
 }
 
 impl ModelProviderInfo {
+    fn inline_api_key(&self) -> Option<String> {
+        self.experimental_bearer_token
+            .as_ref()
+            .filter(|token| !token.trim().is_empty())
+            .cloned()
+    }
+
     fn build_header_map(&self) -> crate::error::Result<HeaderMap> {
         let capacity = self.http_headers.as_ref().map_or(0, HashMap::len)
             + self.env_http_headers.as_ref().map_or(0, HashMap::len);
@@ -143,6 +150,13 @@ impl ModelProviderInfo {
         }
 
         Ok(headers)
+    }
+
+    pub(crate) fn has_explicit_credential_source(&self) -> bool {
+        self.env_key
+            .as_ref()
+            .is_some_and(|env_key| !env_key.trim().is_empty())
+            || self.inline_api_key().is_some()
     }
 
     pub(crate) fn to_api_provider(
@@ -197,7 +211,7 @@ impl ModelProviderInfo {
                     })?;
                 Ok(Some(api_key))
             }
-            None => Ok(self.experimental_bearer_token.clone()),
+            None => Ok(self.inline_api_key()),
         }
     }
 
@@ -521,6 +535,29 @@ api_key = "sk-inline"
         };
         assert_eq!(err.var, env_key.to_string());
         assert_eq!(err.instructions, None);
+    }
+
+    #[test]
+    fn test_blank_inline_api_key_is_treated_as_absent() {
+        let provider = ModelProviderInfo {
+            name: "Example".into(),
+            base_url: Some("https://example.com".into()),
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: Some("   ".into()),
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        };
+
+        assert!(!provider.has_explicit_credential_source());
+        assert_eq!(provider.api_key().unwrap(), None);
     }
 
     #[test]

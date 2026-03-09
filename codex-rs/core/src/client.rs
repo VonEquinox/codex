@@ -504,7 +504,18 @@ impl ModelClientSession {
             return Ok(text.to_string());
         }
 
-        let client_setup = self.client.client_setup_for_provider(provider).await?;
+        if !provider.has_explicit_credential_source() {
+            return Err(CodexErr::Stream(
+                format!(
+                    "translation provider `{}` has no explicit credential source",
+                    provider.name
+                ),
+                None,
+            ));
+        }
+
+        let api_provider = provider.to_api_provider(None)?;
+        let api_auth = auth_provider_from_auth(None, provider)?;
         let request_body = ResponsesApiRequest {
             model: model.to_string(),
             instructions: REASONING_SUMMARY_TRANSLATION_INSTRUCTIONS.to_string(),
@@ -529,20 +540,18 @@ impl ModelClientSession {
             text: None,
         };
 
-        let mut request = client_setup
-            .api_provider
-            .build_request(Method::POST, "responses");
+        let mut request = api_provider.build_request(Method::POST, "responses");
         request.timeout = Some(Duration::from_secs(30));
         request.headers.insert(
             http::header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
-        if let Some(token) = client_setup.api_auth.bearer_token()
+        if let Some(token) = api_auth.bearer_token()
             && let Ok(header) = HeaderValue::from_str(&format!("Bearer {token}"))
         {
             request.headers.insert(http::header::AUTHORIZATION, header);
         }
-        if let Some(account_id) = client_setup.api_auth.account_id()
+        if let Some(account_id) = api_auth.account_id()
             && let Ok(header) = HeaderValue::from_str(&account_id)
         {
             request.headers.insert("ChatGPT-Account-ID", header);
@@ -553,7 +562,7 @@ impl ModelClientSession {
 
         let transport = ReqwestTransport::new(build_reqwest_client());
         let response = run_with_retry(
-            client_setup.api_provider.retry.to_policy(),
+            api_provider.retry.to_policy(),
             || request.clone(),
             |req, _attempt| transport.execute(req),
         )

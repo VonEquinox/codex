@@ -130,20 +130,6 @@ pub async fn handle(
         reported_statuses.insert(member.agent_id, status);
     }
 
-    let agent_statuses = team_member_status_entries(&team.members, &reported_statuses);
-    session
-        .send_event(
-            &turn,
-            CollabWaitingEndEvent {
-                sender_thread_id: session.conversation_id,
-                call_id: event_call_id,
-                agent_statuses,
-                statuses: reported_statuses.clone(),
-            }
-            .into(),
-        )
-        .await;
-
     for (agent_id, state) in &wait_result.statuses {
         if !crate::agent::status::is_final(state) {
             continue;
@@ -162,6 +148,20 @@ pub async fn handle(
             return Err(FunctionCallError::RespondToModel(err));
         }
     }
+
+    let agent_statuses = team_member_status_entries(&team.members, &reported_statuses);
+    session
+        .send_event(
+            &turn,
+            CollabWaitingEndEvent {
+                sender_thread_id: session.conversation_id,
+                call_id: event_call_id,
+                agent_statuses,
+                statuses: reported_statuses.clone(),
+            }
+            .into(),
+        )
+        .await;
 
     let mut member_statuses = Vec::with_capacity(team.members.len());
     for member in &team.members {

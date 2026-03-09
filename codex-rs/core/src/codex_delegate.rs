@@ -205,7 +205,8 @@ async fn forward_events(
                     Err(_) => break,
                 };
                 match event {
-                    // ignore all legacy delta events
+                    // ignore legacy assistant-message/reasoning delta events; the
+                    // parent session will re-bridge structured deltas as needed.
                     Event {
                         id: _,
                         msg: EventMsg::AgentMessageDelta(_) | EventMsg::AgentReasoningDelta(_),

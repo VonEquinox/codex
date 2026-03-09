@@ -360,6 +360,9 @@ pub struct Config {
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
     /// Optional reasoning summary translation provider/model configuration.
+    ///
+    /// Translation is only enabled when the configured provider has its own
+    /// explicit credential source via `env_key` or a non-empty inline `api_key`.
     pub translation: Option<TranslationConfig>,
 
     /// Maximum number of bytes to include from an AGENTS.md project doc file.
@@ -2089,11 +2092,19 @@ impl Config {
             match cfg.translation.clone() {
                 Some(translation_cfg) => match (translation_cfg.provider, translation_cfg.model) {
                     (Some(provider_id), Some(model)) => match model_providers.get(&provider_id) {
-                        Some(provider) => Some(TranslationConfig {
-                            provider_id,
-                            provider: provider.clone(),
-                            model,
-                        }),
+                        Some(provider) if provider.has_explicit_credential_source() => {
+                            Some(TranslationConfig {
+                                provider_id,
+                                provider: provider.clone(),
+                                model,
+                            })
+                        }
+                        Some(_) => {
+                            startup_warnings.push(format!(
+                                "Reasoning summary translation is enabled, but translation provider `{provider_id}` has no explicit credential source (`env_key` or non-empty `api_key`); continuing without translation."
+                            ));
+                            None
+                        }
                         None => {
                             startup_warnings.push(format!(
                                 "Reasoning summary translation is enabled, but translation provider `{provider_id}` was not found; continuing without translation."

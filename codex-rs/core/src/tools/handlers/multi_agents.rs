@@ -61,7 +61,6 @@ use tokio::process::Command;
 use tokio::sync::watch::Receiver;
 use tokio::time::Instant;
 use tokio::time::timeout_at;
-use tracing::debug;
 use tracing::warn;
 
 /// Function-tool handler for the multi-agent collaboration API.
@@ -1475,7 +1474,7 @@ async fn dispatch_worktree_remove_hook(
     session: &Session,
     turn: &TurnContext,
     worktree_path: PathBuf,
-) {
+) -> Result<(), String> {
     let outcomes = session
         .hooks()
         .dispatch(HookPayload {
@@ -1488,26 +1487,36 @@ async fn dispatch_worktree_remove_hook(
         .await;
 
     let mut additional_context = Vec::new();
+    let mut failure = None;
     for outcome in outcomes {
         let hook_name = outcome.hook_name;
         let result = outcome.result;
 
-        if let Some(error) = result.error.as_deref() {
-            debug!(hook_name = %hook_name, error, "worktree_remove hook failed");
+        if failure.is_none()
+            && let Some(error) = result.error.as_deref()
+        {
+            failure = Some(format!(
+                "worktree_remove hook '{hook_name}' failed: {error}"
+            ));
         }
 
-        if let HookResultControl::Block { reason } = result.control {
-            debug!(
-                hook_name = %hook_name,
-                reason,
-                "worktree_remove hook returned a blocking decision; ignoring"
-            );
+        if failure.is_none()
+            && let HookResultControl::Block { reason } = result.control
+        {
+            failure = Some(format!(
+                "worktree_remove hook '{hook_name}' blocked: {reason}"
+            ));
         }
 
         additional_context.extend(result.additional_context);
     }
 
     session.record_hook_context(turn, &additional_context).await;
+    if let Some(err) = failure {
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 fn git_error_text(output: &Output) -> String {
@@ -1594,8 +1603,7 @@ async fn remove_worktree_lease(
     lease: WorktreeLease,
 ) -> Result<(), String> {
     if lease.created_via_hook {
-        dispatch_worktree_remove_hook(session, turn, lease.worktree_path).await;
-        return Ok(());
+        return dispatch_worktree_remove_hook(session, turn, lease.worktree_path).await;
     }
 
     let repo_root = lease
@@ -1625,7 +1633,7 @@ async fn remove_worktree_lease(
     }
 
     let _ = remove_dir_if_exists(&lease.worktree_path).await;
-    dispatch_worktree_remove_hook(session, turn, lease.worktree_path).await;
+    dispatch_worktree_remove_hook(session, turn, lease.worktree_path).await?;
     Ok(())
 }
 

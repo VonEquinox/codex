@@ -1473,7 +1473,9 @@ pub struct ReasoningContentDeltaEvent {
 
 impl HasLegacyEvent for ReasoningContentDeltaEvent {
     fn as_legacy_events(&self, _: bool) -> Vec<EventMsg> {
-        Vec::new()
+        vec![EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
+            delta: self.delta.clone(),
+        })]
     }
 }
 
@@ -3609,7 +3611,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_content_delta_emits_no_legacy_events() {
+    fn reasoning_content_delta_emits_legacy_agent_reasoning_delta() {
         let event = ReasoningContentDeltaEvent {
             thread_id: ThreadId::new().to_string(),
             turn_id: "turn-1".into(),
@@ -3618,7 +3620,12 @@ mod tests {
             summary_index: 0,
         };
 
-        assert!(event.as_legacy_events(false).is_empty());
+        let legacy_events = event.as_legacy_events(false);
+        assert_eq!(legacy_events.len(), 1);
+        match &legacy_events[0] {
+            EventMsg::AgentReasoningDelta(event) => assert_eq!(event.delta, "step one"),
+            _ => panic!("expected AgentReasoningDelta event"),
+        }
     }
 
     #[test]

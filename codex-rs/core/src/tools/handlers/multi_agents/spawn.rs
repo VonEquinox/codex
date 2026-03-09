@@ -113,15 +113,16 @@ pub async fn handle(
     } else {
         None
     };
+    let spawn_options = SpawnAgentOptions {
+        fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
+    };
     let spawn_result = session
         .services
         .agent_control
         .spawn_agent_thread_with_options(
             config.clone(),
-            thread_spawn_session_source,
-            SpawnAgentOptions {
-                fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
-            },
+            thread_spawn_session_source.clone(),
+            spawn_options.clone(),
         )
         .await;
     let result = match spawn_result {
@@ -133,13 +134,10 @@ pub async fn handle(
                 session
                     .services
                     .agent_control
-                    .spawn_agent_thread(
+                    .spawn_agent_thread_with_options(
                         config,
-                        Some(thread_spawn_source_with_role(
-                            session.conversation_id,
-                            child_depth,
-                            role_name.map(str::to_owned),
-                        )),
+                        thread_spawn_session_source,
+                        spawn_options,
                     )
                     .await
             }

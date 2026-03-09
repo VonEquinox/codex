@@ -328,7 +328,6 @@ use codex_protocol::models::DeveloperInstructions;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-use codex_protocol::protocol::AgentReasoningDeltaEvent;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::user_input::UserInput;
@@ -6005,7 +6004,9 @@ pub(crate) async fn run_turn(
                                 HookEvent::SubagentStop {
                                     stop_hook_active,
                                     agent_id: sess.conversation_id.to_string(),
-                                    agent_type: turn_context.session_source.to_string(),
+                                    agent_type: subagent_hook_agent_type(
+                                        &turn_context.session_source,
+                                    ),
                                     agent_transcript_path: transcript_path,
                                     last_assistant_message: last_agent_message.clone(),
                                 }
@@ -6755,6 +6756,15 @@ fn agent_message_text(item: &codex_protocol::items::AgentMessageItem) -> String 
         .collect()
 }
 
+fn subagent_hook_agent_type(session_source: &SessionSource) -> String {
+    match session_source {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
+            agent_role.clone().unwrap_or_else(|| "default".to_string())
+        }
+        other => other.to_string(),
+    }
+}
+
 fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
     match msg {
         EventMsg::AgentMessage(event) => Some(event.message.clone()),
@@ -7065,6 +7075,7 @@ async fn emit_reasoning_display_segment(
     turn_context: &TurnContext,
     client_session: &ModelClientSession,
     reasoning_summary_translation: &ReasoningSummaryTranslationState,
+    item_id: &str,
     segment: PendingReasoningSummarySegment,
 ) {
     let translated = translate_reasoning_summary_text(
@@ -7073,8 +7084,14 @@ async fn emit_reasoning_display_segment(
         &segment.text,
     )
     .await;
-    let event = AgentReasoningDeltaEvent { delta: translated };
-    sess.send_event(turn_context, EventMsg::AgentReasoningDelta(event))
+    let event = ReasoningContentDeltaEvent {
+        thread_id: sess.conversation_id.to_string(),
+        turn_id: turn_context.sub_id.clone(),
+        item_id: item_id.to_string(),
+        delta: translated,
+        summary_index: segment.summary_index,
+    };
+    sess.send_event(turn_context, EventMsg::ReasoningContentDelta(event))
         .await;
 }
 
@@ -7083,6 +7100,8 @@ async fn emit_reasoning_display_delta(
     turn_context: &TurnContext,
     client_session: &ModelClientSession,
     reasoning_summary_translation: &ReasoningSummaryTranslationState,
+    item_id: &str,
+    summary_index: i64,
     delta: String,
 ) {
     let display_delta = if reasoning_summary_translation.config().is_some() {
@@ -7091,10 +7110,14 @@ async fn emit_reasoning_display_delta(
     } else {
         delta
     };
-    let event = AgentReasoningDeltaEvent {
+    let event = ReasoningContentDeltaEvent {
+        thread_id: sess.conversation_id.to_string(),
+        turn_id: turn_context.sub_id.clone(),
+        item_id: item_id.to_string(),
         delta: display_delta,
+        summary_index,
     };
-    sess.send_event(turn_context, EventMsg::AgentReasoningDelta(event))
+    sess.send_event(turn_context, EventMsg::ReasoningContentDelta(event))
         .await;
 }
 
@@ -7280,6 +7303,7 @@ async fn try_run_sampling_request(
                         &turn_context,
                         client_session,
                         &reasoning_summary_translation,
+                        &reasoning_item.id,
                         segment,
                     )
                     .await;
@@ -7460,15 +7484,6 @@ async fn try_run_sampling_request(
             } => {
                 if let Some(active) = active_item.as_ref() {
                     if let TurnItem::Reasoning(reasoning_item) = active {
-                        let event = ReasoningContentDeltaEvent {
-                            thread_id: sess.conversation_id.to_string(),
-                            turn_id: turn_context.sub_id.clone(),
-                            item_id: reasoning_item.id.clone(),
-                            delta: delta.clone(),
-                            summary_index,
-                        };
-                        sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
-                            .await;
                         if let Some(segment) = reasoning_summary_translation.push_delta(
                             &reasoning_item.id,
                             summary_index,
@@ -7479,6 +7494,7 @@ async fn try_run_sampling_request(
                                 &turn_context,
                                 client_session,
                                 &reasoning_summary_translation,
+                                &reasoning_item.id,
                                 segment,
                             )
                             .await;
@@ -7495,25 +7511,21 @@ async fn try_run_sampling_request(
                                 &turn_context,
                                 client_session,
                                 &reasoning_summary_translation,
+                                &reasoning_item.id,
+                                summary_index,
                                 delta,
                             )
                             .await;
                         }
                     } else {
-                        let event = ReasoningContentDeltaEvent {
-                            thread_id: sess.conversation_id.to_string(),
-                            turn_id: turn_context.sub_id.clone(),
-                            item_id: active.id(),
-                            delta: delta.clone(),
-                            summary_index,
-                        };
-                        sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
-                            .await;
+                        let item_id = active.id();
                         emit_reasoning_display_delta(
                             &sess,
                             &turn_context,
                             client_session,
                             &reasoning_summary_translation,
+                            &item_id,
+                            summary_index,
                             delta,
                         )
                         .await;
@@ -7535,6 +7547,7 @@ async fn try_run_sampling_request(
                                 &turn_context,
                                 client_session,
                                 &reasoning_summary_translation,
+                                &reasoning_item.id,
                                 segment,
                             )
                             .await;

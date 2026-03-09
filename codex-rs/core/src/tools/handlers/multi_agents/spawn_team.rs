@@ -117,22 +117,41 @@ pub async fn handle(
         let use_worktree = member.worktree;
         let background = member.background;
 
-        let mut config = build_agent_spawn_config(
-            &session.get_base_instructions().await,
-            turn.as_ref(),
-            child_depth,
-        )?;
-        if let Err(err) = apply_role_to_config(&mut config, role_name).await {
-            let should_ignore_unknown_role = role_name
-                .map(|member_role| err == format!("unknown agent_type '{member_role}'"))
-                .unwrap_or(false);
-            if !should_ignore_unknown_role {
-                return Err(FunctionCallError::RespondToModel(err));
-            }
+        let config_result = async {
+            let mut config = build_agent_spawn_config(
+                &session.get_base_instructions().await,
+                turn.as_ref(),
+                child_depth,
+            )?;
+            apply_role_to_config(&mut config, role_name)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+            apply_member_model_overrides(&mut config, model_provider, model)?;
+            apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+            apply_spawn_agent_overrides(&mut config, child_depth);
+            Ok::<_, FunctionCallError>(config)
         }
-        apply_member_model_overrides(&mut config, model_provider, model)?;
-        apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
-        apply_spawn_agent_overrides(&mut config, child_depth);
+        .await;
+        let mut config = match config_result {
+            Ok(config) => config,
+            Err(err) => {
+                cleanup_spawned_team_members(&session, &turn, &spawned_members).await;
+                let agent_statuses = team_member_status_entries(&spawned_members, &statuses);
+                session
+                    .send_event(
+                        &turn,
+                        CollabWaitingEndEvent {
+                            sender_thread_id: session.conversation_id,
+                            call_id: event_call_id,
+                            agent_statuses,
+                            statuses,
+                        }
+                        .into(),
+                    )
+                    .await;
+                return Err(err);
+            }
+        };
         let worktree_lease = if use_worktree {
             match create_agent_worktree(&session, &turn).await {
                 Ok(lease) => {
