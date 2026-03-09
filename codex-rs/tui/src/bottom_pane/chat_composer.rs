@@ -1540,6 +1540,9 @@ impl ChatComposer {
                         }
                     }
                 }
+                if popup.has_matches() {
+                    return (InputResult::None, true);
+                }
                 // Fallback to default newline handling if no command selected.
                 self.handle_key_event_without_popup(key_event)
             }
@@ -3476,6 +3479,7 @@ impl ChatComposer {
         match &mut self.active_popup {
             ActivePopup::Command(popup) => {
                 if is_editing_slash_command_name {
+                    popup.set_task_running(self.is_task_running);
                     popup.on_composer_text_change(first_line.to_string());
                 } else {
                     self.active_popup = ActivePopup::None;
@@ -3499,6 +3503,7 @@ impl ChatComposer {
                             realtime_conversation_enabled,
                             audio_device_selection_enabled,
                             windows_degraded_sandbox_active: self.windows_degraded_sandbox_active,
+                            is_task_running: self.is_task_running,
                         },
                     );
                     command_popup.on_composer_text_change(first_line.to_string());
@@ -3728,7 +3733,13 @@ impl ChatComposer {
     }
 
     pub fn set_task_running(&mut self, running: bool) {
+        if self.is_task_running == running {
+            return;
+        }
         self.is_task_running = running;
+        if matches!(self.active_popup, ActivePopup::Command(_)) {
+            self.sync_command_popup(true);
+        }
     }
 
     pub(crate) fn set_context_window(
@@ -6726,6 +6737,36 @@ mod tests {
             }
         }
         assert!(found_error, "expected error history cell to be sent");
+    }
+
+    #[test]
+    fn slash_popup_disabled_command_does_not_emit_error_while_task_running() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.textarea.set_text_clearing_elements("/model");
+        composer.sync_popups();
+        composer.set_task_running(true);
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(InputResult::None, result);
+        assert_eq!("/model", composer.textarea.text());
+        assert!(
+            rx.try_recv().is_err(),
+            "did not expect an error history cell"
+        );
     }
 
     #[test]

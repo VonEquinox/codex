@@ -32,6 +32,7 @@ pub(crate) struct CommandPopup {
     builtins: Vec<(&'static str, SlashCommand)>,
     prompts: Vec<CustomPrompt>,
     state: ScrollState,
+    is_task_running: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -43,6 +44,7 @@ pub(crate) struct CommandPopupFlags {
     pub(crate) realtime_conversation_enabled: bool,
     pub(crate) audio_device_selection_enabled: bool,
     pub(crate) windows_degraded_sandbox_active: bool,
+    pub(crate) is_task_running: bool,
 }
 
 impl From<CommandPopupFlags> for slash_commands::BuiltinCommandFlags {
@@ -76,6 +78,7 @@ impl CommandPopup {
             builtins,
             prompts,
             state: ScrollState::new(),
+            is_task_running: flags.is_task_running,
         }
     }
 
@@ -88,6 +91,10 @@ impl CommandPopup {
         prompts.retain(|p| !exclude.contains(&p.name));
         prompts.sort_by(|a, b| a.name.cmp(&b.name));
         self.prompts = prompts;
+    }
+
+    pub(crate) fn set_task_running(&mut self, is_task_running: bool) {
+        self.is_task_running = is_task_running;
     }
 
     pub(crate) fn prompt(&self, idx: usize) -> Option<&CustomPrompt> {
@@ -119,10 +126,44 @@ impl CommandPopup {
         }
 
         // Reset or clamp selected index based on new filtered list.
-        let matches_len = self.filtered_items().len();
+        let matches = self.filtered_items();
+        let matches_len = matches.len();
         self.state.clamp_selection(matches_len);
+        self.normalize_selection(&matches);
         self.state
             .ensure_visible(matches_len, MAX_POPUP_ROWS.min(matches_len));
+    }
+
+    fn is_item_disabled(&self, item: CommandItem) -> bool {
+        matches!(
+            item,
+            CommandItem::Builtin(cmd) if self.is_task_running && !cmd.available_during_task()
+        )
+    }
+
+    fn normalize_selection(&mut self, items: &[CommandItem]) {
+        let len = items.len();
+        if len == 0 {
+            self.state.selected_idx = None;
+            return;
+        }
+
+        let Some(selected_idx) = self.state.selected_idx else {
+            self.state.selected_idx = items.iter().position(|item| !self.is_item_disabled(*item));
+            return;
+        };
+
+        if !self.is_item_disabled(items[selected_idx]) {
+            return;
+        }
+
+        self.state.selected_idx = (0..len)
+            .map(|offset| (selected_idx + offset + 1) % len)
+            .find(|&idx| !self.is_item_disabled(items[idx]));
+    }
+
+    pub(crate) fn has_matches(&self) -> bool {
+        !self.filtered_items().is_empty()
     }
 
     /// Determine the preferred height of the popup for a given width.
@@ -231,6 +272,7 @@ impl CommandPopup {
                         )
                     }
                 };
+                let is_disabled = self.is_item_disabled(item);
                 GenericDisplayRow {
                     name,
                     name_prefix_spans: Vec::new(),
@@ -239,8 +281,8 @@ impl CommandPopup {
                     description: Some(description),
                     category_tag: None,
                     wrap_indent: None,
-                    is_disabled: false,
-                    disabled_reason: None,
+                    is_disabled,
+                    disabled_reason: is_disabled.then_some("task in progress".to_string()),
                 }
             })
             .collect()
@@ -248,15 +290,19 @@ impl CommandPopup {
 
     /// Move the selection cursor one step up.
     pub(crate) fn move_up(&mut self) {
-        let len = self.filtered_items().len();
+        let items = self.filtered_items();
+        let len = items.len();
         self.state.move_up_wrap(len);
+        self.normalize_selection(&items);
         self.state.ensure_visible(len, MAX_POPUP_ROWS.min(len));
     }
 
     /// Move the selection cursor one step down.
     pub(crate) fn move_down(&mut self) {
-        let matches_len = self.filtered_items().len();
+        let items = self.filtered_items();
+        let matches_len = items.len();
         self.state.move_down_wrap(matches_len);
+        self.normalize_selection(&items);
         self.state
             .ensure_visible(matches_len, MAX_POPUP_ROWS.min(matches_len));
     }
@@ -267,6 +313,7 @@ impl CommandPopup {
         self.state
             .selected_idx
             .and_then(|idx| matches.get(idx).copied())
+            .filter(|item| !self.is_item_disabled(*item))
     }
 }
 
@@ -352,6 +399,45 @@ mod tests {
             })
             .collect();
         assert_eq!(cmds, vec!["model", "mention", "mcp", "multi-agents"]);
+    }
+
+    #[test]
+    fn task_running_marks_blocked_commands_disabled() {
+        let mut popup = CommandPopup::new(
+            Vec::new(),
+            CommandPopupFlags {
+                is_task_running: true,
+                ..CommandPopupFlags::default()
+            },
+        );
+        popup.on_composer_text_change("/mo".to_string());
+
+        let rows = popup.rows_from_matches(popup.filtered());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "/model");
+        assert_eq!(rows[0].is_disabled, true);
+        assert_eq!(rows[0].disabled_reason.as_deref(), Some("task in progress"));
+        assert_eq!(popup.selected_item(), None);
+    }
+
+    #[test]
+    fn task_running_skips_disabled_selection_when_enabled_match_exists() {
+        let mut popup = CommandPopup::new(
+            Vec::new(),
+            CommandPopupFlags {
+                is_task_running: true,
+                ..CommandPopupFlags::default()
+            },
+        );
+        popup.on_composer_text_change("/m".to_string());
+
+        match popup.selected_item() {
+            Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "mention"),
+            Some(CommandItem::UserPrompt(_)) => {
+                panic!("unexpected prompt selected for '/m' while task is running")
+            }
+            None => panic!("expected an enabled command selection for '/m'"),
+        }
     }
 
     #[test]
@@ -512,6 +598,7 @@ mod tests {
                 realtime_conversation_enabled: false,
                 audio_device_selection_enabled: false,
                 windows_degraded_sandbox_active: false,
+                is_task_running: false,
             },
         );
         popup.on_composer_text_change("/collab".to_string());
@@ -534,6 +621,7 @@ mod tests {
                 realtime_conversation_enabled: false,
                 audio_device_selection_enabled: false,
                 windows_degraded_sandbox_active: false,
+                is_task_running: false,
             },
         );
         popup.on_composer_text_change("/plan".to_string());
@@ -556,6 +644,7 @@ mod tests {
                 realtime_conversation_enabled: false,
                 audio_device_selection_enabled: false,
                 windows_degraded_sandbox_active: false,
+                is_task_running: false,
             },
         );
         popup.on_composer_text_change("/pers".to_string());
@@ -586,6 +675,7 @@ mod tests {
                 realtime_conversation_enabled: false,
                 audio_device_selection_enabled: false,
                 windows_degraded_sandbox_active: false,
+                is_task_running: false,
             },
         );
         popup.on_composer_text_change("/personality".to_string());
@@ -608,6 +698,7 @@ mod tests {
                 realtime_conversation_enabled: true,
                 audio_device_selection_enabled: false,
                 windows_degraded_sandbox_active: false,
+                is_task_running: false,
             },
         );
         popup.on_composer_text_change("/aud".to_string());

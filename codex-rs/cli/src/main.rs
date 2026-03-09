@@ -550,7 +550,36 @@ fn stage_str(stage: codex_core::features::Stage) -> &'static str {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn is_false_macos_malloc_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn sanitize_false_macos_malloc_env() {
+    // Some macOS terminal/tooling stacks export `MallocStackLogging=0` (or similar false-y
+    // variants). Child `eqcodex` processes inherit that value and libmalloc prints a noisy
+    // warning on startup for every spawned agent process. Strip only explicit false values so we
+    // do not interfere with intentionally enabled malloc logging.
+    for key in ["MallocStackLogging", "MallocStackLoggingNoCompact"] {
+        let Some(value) = std::env::var_os(key) else {
+            continue;
+        };
+        if is_false_macos_malloc_env_value(value.to_string_lossy().as_ref()) {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    sanitize_false_macos_malloc_env();
+
     arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
         cli_main(arg0_paths).await?;
         Ok(())
@@ -1526,5 +1555,16 @@ mod tests {
             .to_overrides()
             .expect_err("feature should be rejected");
         assert_eq!(err.to_string(), "Unknown feature flag: does_not_exist");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn false_macos_malloc_env_values_are_detected() {
+        for value in ["0", "false", "FALSE", " off ", "No"] {
+            assert_eq!(is_false_macos_malloc_env_value(value), true);
+        }
+        for value in ["1", "true", "", "  ", "lite"] {
+            assert_eq!(is_false_macos_malloc_env_value(value), false);
+        }
     }
 }
