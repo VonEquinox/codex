@@ -6984,6 +6984,57 @@ async fn multi_agent_enable_prompt_updates_feature_and_emits_notice() {
 }
 
 #[tokio::test]
+async fn hooks_menu_popup_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.config.codex_home = PathBuf::from("/home/user/.codex");
+    chat.config.cwd = PathBuf::from("/home/user/project");
+    chat.config.config_layer_stack = codex_core::config_loader::ConfigLayerStack::new(
+        vec![codex_core::config_loader::ConfigLayerEntry::new(
+            codex_app_server_protocol::ConfigLayerSource::Project {
+                dot_codex_folder: AbsolutePathBuf::try_from("/home/user/project/.codex")
+                    .expect("absolute project hooks path"),
+            },
+            TomlValue::Table(toml::map::Map::new()),
+        )],
+        Default::default(),
+        Default::default(),
+    )
+    .expect("config layer stack");
+
+    chat.dispatch_command(SlashCommand::Hooks);
+
+    let popup = render_bottom_popup(&chat, 120);
+    assert_snapshot!("hooks_menu_popup", popup);
+}
+
+#[tokio::test]
+async fn hooks_manager_popup_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.open_hooks_manager_view(
+        "Global hooks (user)".to_string(),
+        PathBuf::from("/home/user/.codex/config.toml"),
+        super::hooks::HOOKS_CONFIG_SEED.to_string(),
+        None,
+        vec![crate::hooks_config::HookListEntry {
+            id: crate::hooks_config::HookId {
+                event: "stop".to_string(),
+                index: 0,
+            },
+            title: "stop: Stop hook".to_string(),
+            description: Some("\"echo hi\"".to_string()),
+            selected_description: Some(
+                "Event: stop\nIndex: 0\nCommand: \"echo hi\"\nName: Stop hook".to_string(),
+            ),
+            search_value: "stop 0 stop: Stop hook \"echo hi\"".to_string(),
+        }],
+    );
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("hooks_manager_popup", popup);
+}
+
+#[tokio::test]
 async fn model_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
     chat.thread_id = Some(ThreadId::new());

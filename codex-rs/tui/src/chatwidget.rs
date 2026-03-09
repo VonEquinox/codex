@@ -270,6 +270,7 @@ mod agent;
 use self::agent::spawn_agent;
 use self::agent::spawn_agent_from_existing;
 pub(crate) use self::agent::spawn_op_forwarder;
+mod hooks;
 mod session_header;
 use self::session_header::SessionHeader;
 mod skills;
@@ -4090,6 +4091,9 @@ impl ChatWidget {
             }
             SlashCommand::Skills => {
                 self.open_skills_menu();
+            }
+            SlashCommand::Hooks => {
+                self.open_hooks_menu();
             }
             SlashCommand::Status => {
                 self.add_status_output();

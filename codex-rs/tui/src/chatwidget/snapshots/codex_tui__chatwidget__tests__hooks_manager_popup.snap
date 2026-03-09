@@ -1,0 +1,13 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: popup
+---
+  Global hooks (user)
+  /home/user/.codex/config.toml
+
+  Type to search hooks
+› Add hook              Create a new hook entry.
+  Edit raw config.toml  Edit the entire file (advanced).
+  stop: Stop hook       "echo hi"
+
+  Press enter to confirm or esc to go back

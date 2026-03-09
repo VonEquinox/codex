@@ -29,6 +29,7 @@ use crate::exec_policy::ExecPolicyManager;
 use crate::features::FEATURES;
 use crate::features::Feature;
 use crate::features::maybe_push_unstable_features_warning;
+use crate::hooks_executor::HooksNonCommandExecutor;
 #[cfg(test)]
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
@@ -59,10 +60,12 @@ use chrono::Local;
 use chrono::Utc;
 use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
+use codex_hooks::CommandHooksConfig;
 use codex_hooks::HookEvent;
-use codex_hooks::HookEventAfterAgent;
 use codex_hooks::HookPayload;
+use codex_hooks::HookResponse;
 use codex_hooks::HookResult;
+use codex_hooks::HookResultControl;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use codex_network_proxy::NetworkProxy;
@@ -126,6 +129,7 @@ use serde_json;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -142,6 +146,16 @@ use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
 use uuid::Uuid;
+
+fn command_hooks_for_config(config: &crate::config::Config) -> CommandHooksConfig {
+    match crate::config::hooks::command_hooks_from_layer_stack(&config.config_layer_stack) {
+        Ok(command_hooks) => command_hooks,
+        Err(error) => {
+            warn!(%error, "failed to parse config.toml [hooks]; ignoring");
+            CommandHooksConfig::default()
+        }
+    }
+}
 
 use crate::ModelProviderInfo;
 use crate::client::ModelClient;
@@ -1087,10 +1101,68 @@ impl Session {
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(FileWatcherEvent::SkillsChanged { .. }) => {
+                    Ok(FileWatcherEvent::SkillsChanged { paths }) => {
                         let Some(sess) = weak_sess.upgrade() else {
                             break;
                         };
+                        let (cwd, permission_mode) = {
+                            let state = sess.state.lock().await;
+                            (
+                                state.session_configuration.cwd.clone(),
+                                state
+                                    .session_configuration
+                                    .approval_policy
+                                    .value()
+                                    .to_string(),
+                            )
+                        };
+                        let hook_outcomes = sess
+                            .hooks()
+                            .dispatch(HookPayload {
+                                session_id: sess.conversation_id,
+                                transcript_path: sess.transcript_path().await,
+                                cwd,
+                                permission_mode,
+                                hook_event: HookEvent::ConfigChange {
+                                    source: "skills".to_string(),
+                                    file_path: paths.into_iter().next(),
+                                },
+                            })
+                            .await;
+                        let mut blocked = None;
+                        let mut additional_context = Vec::new();
+                        for hook_outcome in hook_outcomes {
+                            let hook_name = hook_outcome.hook_name;
+                            let result = hook_outcome.result;
+                            if let Some(error) = result.error.as_deref() {
+                                warn!(
+                                    hook_name = %hook_name,
+                                    error,
+                                    "config_change hook failed; continuing"
+                                );
+                            }
+                            additional_context.extend(result.additional_context);
+                            if let HookResultControl::Block { reason } = result.control {
+                                blocked = Some((hook_name, reason));
+                                break;
+                            }
+                        }
+                        if !additional_context.is_empty() {
+                            let mut guard = sess.services.pending_hook_context.lock().await;
+                            guard.extend(additional_context);
+                        }
+                        if let Some((hook_name, reason)) = blocked {
+                            let event = Event {
+                                id: sess.next_internal_sub_id(),
+                                msg: EventMsg::Warning(WarningEvent {
+                                    message: format!(
+                                        "config_change hook '{hook_name}' blocked skills update: {reason}"
+                                    ),
+                                }),
+                            };
+                            sess.send_event_raw(event).await;
+                            continue;
+                        }
                         let event = Event {
                             id: sess.next_internal_sub_id(),
                             msg: EventMsg::SkillsUpdateAvailable,
@@ -1099,6 +1171,43 @@ impl Session {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+    }
+
+    fn start_hook_async_results_listener(
+        self: &Arc<Self>,
+        mut rx: mpsc::UnboundedReceiver<HookResponse>,
+    ) {
+        let weak_sess = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while let Some(hook_response) = rx.recv().await {
+                let Some(sess) = weak_sess.upgrade() else {
+                    break;
+                };
+
+                let HookResponse {
+                    hook_name,
+                    result:
+                        HookResult {
+                            mut additional_context,
+                            error,
+                            ..
+                        },
+                } = hook_response;
+
+                if let Some(error) = error.as_deref() {
+                    warn!(
+                        hook_name = %hook_name,
+                        error,
+                        "async hook failed; continuing"
+                    );
+                }
+
+                if !additional_context.is_empty() {
+                    let mut guard = sess.services.pending_hook_context.lock().await;
+                    guard.append(&mut additional_context);
                 }
             }
         });
@@ -1524,6 +1633,31 @@ impl Session {
                 (None, None)
             };
 
+        let model_client = ModelClient::new(
+            Some(Arc::clone(&auth_manager)),
+            conversation_id,
+            session_configuration.provider.clone(),
+            session_configuration.session_source.clone(),
+            config.model_verbosity,
+            ws_version_from_features(config.as_ref()),
+            config.features.enabled(Feature::EnableRequestCompression),
+            config.features.enabled(Feature::RuntimeMetrics),
+            Self::build_model_client_beta_features_header(config.as_ref()),
+        );
+        let (hook_async_results_tx, hook_async_results_rx) = mpsc::unbounded_channel();
+        let mut hooks = Hooks::new(HooksConfig {
+            command_hooks: command_hooks_for_config(config.as_ref()),
+        });
+        hooks.set_async_results_tx(hook_async_results_tx);
+        hooks.set_non_command_executor(Arc::new(HooksNonCommandExecutor {
+            model_client: model_client.clone(),
+            models_manager: Arc::clone(&models_manager),
+            session_telemetry: session_telemetry.clone(),
+            agent_control: agent_control.clone(),
+            config: Arc::clone(&config),
+            default_model: session_configuration.collaboration_mode.model().to_string(),
+        }));
+
         let services = SessionServices {
             // Initialize the MCP connection manager with an uninitialized
             // instance. It will be replaced with one created via
@@ -1545,9 +1679,8 @@ impl Session {
                 Arc::clone(&config),
                 Arc::clone(&auth_manager),
             ),
-            hooks: Hooks::new(HooksConfig {
-                legacy_notify_argv: config.notify.clone(),
-            }),
+            hooks,
+            pending_hook_context: Mutex::new(Vec::new()),
             rollout: Mutex::new(rollout_recorder),
             user_shell: Arc::new(default_shell),
             shell_snapshot_tx,
@@ -1566,17 +1699,7 @@ impl Session {
             network_proxy,
             network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
-            model_client: ModelClient::new(
-                Some(Arc::clone(&auth_manager)),
-                conversation_id,
-                session_configuration.provider.clone(),
-                session_configuration.session_source.clone(),
-                config.model_verbosity,
-                ws_version_from_features(config.as_ref()),
-                config.features.enabled(Feature::EnableRequestCompression),
-                config.features.enabled(Feature::RuntimeMetrics),
-                Self::build_model_client_beta_features_header(config.as_ref()),
-            ),
+            model_client,
         };
         let js_repl = Arc::new(JsReplHandle::with_node_path(
             config.js_repl_node_path.clone(),
@@ -1629,6 +1752,7 @@ impl Session {
         }
 
         // Start the watcher after SessionConfigured so it cannot emit earlier events.
+        sess.start_hook_async_results_listener(hook_async_results_rx);
         sess.start_file_watcher_listener();
         // Construct sandbox_state before MCP startup so it can be sent to each
         // MCP server immediately after it becomes ready (avoiding blocking).
@@ -1697,6 +1821,50 @@ impl Session {
 
         // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
         sess.record_initial_history(initial_history).await;
+
+        let hook_outcomes = sess
+            .hooks()
+            .dispatch(HookPayload {
+                session_id: sess.conversation_id,
+                transcript_path: sess.transcript_path().await,
+                cwd: session_configuration.cwd.clone(),
+                permission_mode: session_configuration.approval_policy.value().to_string(),
+                hook_event: HookEvent::SessionStart {
+                    source: session_configuration.session_source.to_string(),
+                    model: session_configuration.collaboration_mode.model().to_string(),
+                    agent_type: match &session_configuration.session_source {
+                        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                            agent_role, ..
+                        }) => agent_role.clone(),
+                        _ => None,
+                    },
+                },
+            })
+            .await;
+        let mut additional_context = Vec::new();
+        for hook_outcome in hook_outcomes {
+            let hook_name = hook_outcome.hook_name;
+            let result = hook_outcome.result;
+            if let Some(error) = result.error.as_deref() {
+                warn!(
+                    hook_name = %hook_name,
+                    error,
+                    "session_start hook failed; continuing"
+                );
+            }
+            if let HookResultControl::Block { reason } = result.control {
+                warn!(
+                    hook_name = %hook_name,
+                    reason,
+                    "session_start hook returned a blocking decision; ignoring"
+                );
+            }
+            additional_context.extend(result.additional_context);
+        }
+        if !additional_context.is_empty() {
+            let mut guard = sess.services.pending_hook_context.lock().await;
+            guard.extend(additional_context);
+        }
 
         memories::start_memories_startup_task(
             &sess,
@@ -2721,23 +2889,6 @@ impl Session {
         //  command-level approvals use `call_id`.
         // `approval_id` is only present for subcommand callbacks (execve intercept)
         let effective_approval_id = approval_id.clone().unwrap_or_else(|| call_id.clone());
-        // Add the tx_approve callback to the map before sending the request.
-        let (tx_approve, rx_approve) = oneshot::channel();
-        let prev_entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_approval(effective_approval_id.clone(), tx_approve)
-                }
-                None => None,
-            }
-        };
-        if prev_entry.is_some() {
-            warn!("Overwriting existing pending approval for call_id: {effective_approval_id}");
-        }
-
-        let parsed_cmd = parse_command(&command);
         let proposed_network_policy_amendments = network_approval_context.as_ref().map(|context| {
             vec![
                 NetworkPolicyAmendment {
@@ -2758,6 +2909,98 @@ impl Session {
                 additional_permissions.as_ref(),
             )
         });
+
+        let hook_outcomes = self
+            .hooks()
+            .dispatch(HookPayload {
+                session_id: self.conversation_id,
+                transcript_path: self.transcript_path().await,
+                cwd: turn_context.cwd.clone(),
+                permission_mode: turn_context.approval_policy.value().to_string(),
+                hook_event: HookEvent::PermissionRequest {
+                    tool_name: "exec_command".to_string(),
+                    tool_input: serde_json::json!({
+                        "command": command.clone(),
+                        "cwd": cwd.clone(),
+                        "reason": reason.clone(),
+                        "network_approval_context": network_approval_context.clone(),
+                        "proposed_execpolicy_amendment": proposed_execpolicy_amendment.clone(),
+                        "proposed_network_policy_amendments": proposed_network_policy_amendments.clone(),
+                        "additional_permissions": additional_permissions.clone(),
+                        "available_decisions": available_decisions.clone(),
+                    }),
+                    tool_use_id: effective_approval_id.clone(),
+                    permission_suggestions: None,
+                },
+            })
+            .await;
+        let mut additional_context = Vec::new();
+        let mut hook_blocked = None;
+        let mut hook_permission_decision = None;
+        let mut hook_permission_decision_reason = None;
+        for hook_outcome in hook_outcomes {
+            let hook_name = hook_outcome.hook_name;
+            let result = hook_outcome.result;
+            if let Some(error) = result.error.as_deref() {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    hook_name = %hook_name,
+                    error,
+                    "permission_request hook failed; continuing"
+                );
+            }
+            if let HookResultControl::Block { reason } = result.control {
+                hook_blocked = Some((hook_name, reason));
+                break;
+            }
+            additional_context.extend(result.additional_context);
+            if let Some(decision) = result.permission_decision {
+                hook_permission_decision = Some(decision);
+                hook_permission_decision_reason = result.permission_decision_reason;
+            }
+        }
+        if let Some(reason) = hook_permission_decision_reason.as_deref()
+            && matches!(
+                hook_permission_decision,
+                Some(codex_hooks::HookPermissionDecision::Deny)
+                    | Some(codex_hooks::HookPermissionDecision::Ask)
+            )
+        {
+            additional_context.push(reason.to_string());
+        }
+        if let Some((hook_name, reason)) = hook_blocked.as_ref() {
+            additional_context.push(format!(
+                "permission_request hook '{hook_name}' blocked: {reason}"
+            ));
+        }
+        self.record_hook_context(turn_context, &additional_context)
+            .await;
+
+        if hook_blocked.is_some() {
+            return ReviewDecision::Denied;
+        }
+        match hook_permission_decision {
+            Some(codex_hooks::HookPermissionDecision::Allow) => return ReviewDecision::Approved,
+            Some(codex_hooks::HookPermissionDecision::Deny) => return ReviewDecision::Denied,
+            Some(codex_hooks::HookPermissionDecision::Ask) | None => {}
+        }
+
+        let (tx_approve, rx_approve) = oneshot::channel();
+        let prev_entry = {
+            let mut active = self.active_turn.lock().await;
+            match active.as_mut() {
+                Some(at) => {
+                    let mut ts = at.turn_state.lock().await;
+                    ts.insert_pending_approval(effective_approval_id.clone(), tx_approve)
+                }
+                None => None,
+            }
+        };
+        if prev_entry.is_some() {
+            warn!("Overwriting existing pending approval for call_id: {effective_approval_id}");
+        }
+
+        let parsed_cmd = parse_command(&command);
         let event = EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
             call_id,
             approval_id,
@@ -2772,6 +3015,46 @@ impl Session {
             available_decisions: Some(available_decisions),
             parsed_cmd,
         });
+
+        let outcomes = self
+            .hooks()
+            .dispatch(HookPayload {
+                session_id: self.conversation_id,
+                transcript_path: self.transcript_path().await,
+                cwd: turn_context.cwd.clone(),
+                permission_mode: turn_context.approval_policy.value().to_string(),
+                hook_event: HookEvent::Notification {
+                    message: "Permission approval requested".to_string(),
+                    title: Some("Permission required".to_string()),
+                    notification_type: "permission_prompt".to_string(),
+                },
+            })
+            .await;
+        let mut additional_context = Vec::new();
+        for outcome in outcomes {
+            let hook_name = outcome.hook_name;
+            let result = outcome.result;
+            if let Some(error) = result.error.as_deref() {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    hook_name = %hook_name,
+                    error,
+                    "notification hook failed; continuing"
+                );
+            }
+            if let HookResultControl::Block { reason } = result.control {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    hook_name = %hook_name,
+                    reason,
+                    "notification hook returned a blocking decision; ignoring"
+                );
+            }
+            additional_context.extend(result.additional_context);
+        }
+        self.record_hook_context(turn_context, &additional_context)
+            .await;
+
         self.send_event(turn_context, event).await;
         rx_approve.await.unwrap_or_default()
     }
@@ -3193,6 +3476,11 @@ impl Session {
             )
             .into_text(),
         );
+        let pending_hook_context = {
+            let mut guard = self.services.pending_hook_context.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        developer_sections.extend(pending_hook_context);
         if let Some(developer_instructions) = turn_context.developer_instructions.as_deref() {
             developer_sections.push(developer_instructions.to_string());
         }
@@ -3695,6 +3983,132 @@ impl Session {
         }
     }
 
+    pub(crate) async fn transcript_path(&self) -> Option<PathBuf> {
+        let guard = self.services.rollout.lock().await;
+        Some(guard.as_ref()?.rollout_path().to_path_buf())
+    }
+
+    pub(crate) async fn record_hook_context(
+        &self,
+        turn_context: &TurnContext,
+        additional_context: &[String],
+    ) {
+        let Some(item) = crate::context_manager::updates::build_developer_update_item(
+            additional_context.to_vec(),
+        ) else {
+            return;
+        };
+
+        self.record_into_history(std::slice::from_ref(&item), turn_context)
+            .await;
+        self.persist_rollout_response_items(std::slice::from_ref(&item))
+            .await;
+    }
+
+    pub(crate) async fn dispatch_user_prompt_submit_hook(
+        &self,
+        turn_context: &TurnContext,
+        items: &[UserInput],
+    ) -> Option<String> {
+        let prompt = items
+            .iter()
+            .map(|item| match item {
+                UserInput::Text { text, .. } => text.clone(),
+                UserInput::Image { .. } => "[image]".to_string(),
+                UserInput::LocalImage { path } => format!("[local_image:{}]", path.display()),
+                UserInput::Skill { name, path } => {
+                    format!("[skill:${name}]({})", path.display())
+                }
+                UserInput::Mention { name, path } => format!("[mention:${name}]({path})"),
+                _ => "[input]".to_string(),
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let hook_outcomes = self
+            .hooks()
+            .dispatch(HookPayload {
+                session_id: self.conversation_id,
+                transcript_path: self.transcript_path().await,
+                cwd: turn_context.cwd.clone(),
+                permission_mode: turn_context.approval_policy.value().to_string(),
+                hook_event: HookEvent::UserPromptSubmit { prompt },
+            })
+            .await;
+
+        let mut additional_context = Vec::new();
+        let mut blocked = None;
+        for hook_outcome in hook_outcomes {
+            let hook_name = hook_outcome.hook_name;
+            let result = hook_outcome.result;
+            if let Some(error) = result.error.as_deref() {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    hook_name = %hook_name,
+                    error,
+                    "user_prompt_submit hook failed; continuing"
+                );
+            }
+            if let HookResultControl::Block { reason } = result.control {
+                blocked = Some((hook_name, reason));
+                break;
+            }
+            additional_context.extend(result.additional_context);
+        }
+
+        self.record_hook_context(turn_context, &additional_context)
+            .await;
+        blocked.map(|(hook_name, reason)| {
+            format!("user_prompt_submit hook '{hook_name}' blocked: {reason}")
+        })
+    }
+
+    pub(crate) async fn dispatch_pre_compact_hook(
+        &self,
+        turn_context: &TurnContext,
+        trigger: &str,
+    ) {
+        let hook_outcomes = self
+            .hooks()
+            .dispatch(HookPayload {
+                session_id: self.conversation_id,
+                transcript_path: self.transcript_path().await,
+                cwd: turn_context.cwd.clone(),
+                permission_mode: turn_context.approval_policy.value().to_string(),
+                hook_event: HookEvent::PreCompact {
+                    trigger: trigger.to_string(),
+                    custom_instructions: turn_context.compact_prompt.clone(),
+                },
+            })
+            .await;
+
+        let mut additional_context = Vec::new();
+        for hook_outcome in hook_outcomes {
+            let hook_name = hook_outcome.hook_name;
+            let result = hook_outcome.result;
+            if let Some(error) = result.error.as_deref() {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    hook_name = %hook_name,
+                    error,
+                    "pre_compact hook failed; continuing"
+                );
+            }
+            if let HookResultControl::Block { reason } = result.control {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    hook_name = %hook_name,
+                    reason,
+                    "pre_compact hook returned a blocking decision; ignoring"
+                );
+            }
+            additional_context.extend(result.additional_context);
+        }
+
+        self.record_hook_context(turn_context, &additional_context)
+            .await;
+    }
+
     pub(crate) fn hooks(&self) -> &Hooks {
         &self.services.hooks
     }
@@ -4044,6 +4458,46 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             break;
         }
     }
+    let reason = "submission_channel_closed".to_string();
+    let (cwd, permission_mode) = {
+        let state = sess.state.lock().await;
+        (
+            state.session_configuration.cwd.clone(),
+            state
+                .session_configuration
+                .approval_policy
+                .value()
+                .to_string(),
+        )
+    };
+    let hook_outcomes = sess
+        .hooks()
+        .dispatch(HookPayload {
+            session_id: sess.conversation_id,
+            transcript_path: sess.transcript_path().await,
+            cwd,
+            permission_mode,
+            hook_event: HookEvent::SessionEnd { reason },
+        })
+        .await;
+    for hook_outcome in hook_outcomes {
+        let hook_name = hook_outcome.hook_name;
+        let result = hook_outcome.result;
+        if let Some(error) = result.error.as_deref() {
+            warn!(
+                hook_name = %hook_name,
+                error,
+                "session_end hook failed; continuing"
+            );
+        }
+        if let HookResultControl::Block { reason } = result.control {
+            warn!(
+                hook_name = %hook_name,
+                reason,
+                "session_end hook returned a blocking decision; ignoring"
+            );
+        }
+    }
     debug!("Agent loop exited");
 }
 
@@ -4208,6 +4662,17 @@ mod handlers {
         };
         sess.maybe_emit_unknown_model_warning_for_turn(current_context.as_ref())
             .await;
+        if let Some(reason) = sess
+            .dispatch_user_prompt_submit_hook(current_context.as_ref(), &items)
+            .await
+        {
+            sess.send_event(
+                current_context.as_ref(),
+                EventMsg::Warning(WarningEvent { message: reason }),
+            )
+            .await;
+            return;
+        }
         current_context.session_telemetry.user_prompt(&items);
 
         // Attempt to inject input into current task.
@@ -4581,6 +5046,8 @@ mod handlers {
     pub async fn compact(sess: &Arc<Session>, sub_id: String) {
         let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
 
+        sess.dispatch_pre_compact_hook(turn_context.as_ref(), "manual_compact")
+            .await;
         sess.spawn_task(
             Arc::clone(&turn_context),
             vec![UserInput::Text {
@@ -5107,6 +5574,34 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
+struct ScopedHooksGuard {
+    hooks: Hooks,
+    scope_id: String,
+}
+
+impl Drop for ScopedHooksGuard {
+    fn drop(&mut self) {
+        self.hooks.remove_scoped_hooks(&self.scope_id);
+    }
+}
+
+fn install_skill_scoped_hooks(
+    hooks: &Hooks,
+    turn_id: &str,
+    skill_scoped_hooks: Vec<crate::skills::injection::SkillScopedHooks>,
+) -> Vec<ScopedHooksGuard> {
+    let mut guards = Vec::with_capacity(skill_scoped_hooks.len());
+    for scoped in skill_scoped_hooks {
+        let scope_id = format!("{turn_id}:skill:{}", scoped.skill_name);
+        hooks.insert_scoped_command_hooks(scope_id.clone(), scoped.hooks);
+        guards.push(ScopedHooksGuard {
+            hooks: hooks.clone(),
+            scope_id,
+        });
+    }
+    guards
+}
+
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 /// replies with either:
 ///
@@ -5237,6 +5732,7 @@ pub(crate) async fn run_turn(
     let SkillInjections {
         items: skill_items,
         warnings: skill_warnings,
+        scoped_hooks: skill_scoped_hooks,
     } = build_skill_injections(
         &mentioned_skills,
         Some(&session_telemetry),
@@ -5244,6 +5740,9 @@ pub(crate) async fn run_turn(
         tracking.clone(),
     )
     .await;
+
+    let _scoped_hook_guards =
+        install_skill_scoped_hooks(sess.hooks(), &turn_context.sub_id, skill_scoped_hooks);
 
     for message in skill_warnings {
         sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
@@ -5322,6 +5821,7 @@ pub(crate) async fn run_turn(
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let mut server_model_warning_emitted_for_turn = false;
+    let mut stop_hook_active = false;
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -5427,64 +5927,133 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
+                    if let Some(notify_argv) = turn_context
+                        .config
+                        .notify
+                        .as_ref()
+                        .filter(|argv| !argv.is_empty())
+                    {
+                        let payload = serde_json::json!({
+                            "type": "agent-turn-complete",
+                            "thread-id": sess.conversation_id.to_string(),
+                            "turn-id": turn_context.sub_id.clone(),
+                            "cwd": turn_context.cwd.display().to_string(),
+                            "client": turn_context.app_server_client_name.clone(),
+                            "input-messages": sampling_request_input_messages,
+                            "last-assistant-message": last_agent_message.clone(),
+                        });
+                        match serde_json::to_string(&payload) {
+                            Ok(payload_json) => {
+                                let mut command = tokio::process::Command::new(&notify_argv[0]);
+                                command.args(&notify_argv[1..]);
+                                command.arg(payload_json);
+                                if turn_context.cwd.is_dir() {
+                                    command.current_dir(&turn_context.cwd);
+                                }
+                                command
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .kill_on_drop(false);
+                                match command.spawn() {
+                                    Ok(mut child) => {
+                                        tokio::spawn(async move {
+                                            let _ = child.wait().await;
+                                        });
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            turn_id = %turn_context.sub_id,
+                                            %err,
+                                            "notify failed; continuing"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                warn!(
+                                    turn_id = %turn_context.sub_id,
+                                    %err,
+                                    "notify payload serialization failed; continuing"
+                                );
+                            }
+                        }
+                    }
+                    let is_subagent_stop =
+                        matches!(&turn_context.session_source, SessionSource::SubAgent(_));
+                    let transcript_path = sess.transcript_path().await;
                     let hook_outcomes = sess
                         .hooks()
                         .dispatch(HookPayload {
                             session_id: sess.conversation_id,
+                            transcript_path: transcript_path.clone(),
                             cwd: turn_context.cwd.clone(),
-                            client: turn_context.app_server_client_name.clone(),
-                            triggered_at: chrono::Utc::now(),
-                            hook_event: HookEvent::AfterAgent {
-                                event: HookEventAfterAgent {
-                                    thread_id: sess.conversation_id,
-                                    turn_id: turn_context.sub_id.clone(),
-                                    input_messages: sampling_request_input_messages,
+                            permission_mode: turn_context.approval_policy.value().to_string(),
+                            hook_event: if is_subagent_stop {
+                                HookEvent::SubagentStop {
+                                    stop_hook_active,
+                                    agent_id: sess.conversation_id.to_string(),
+                                    agent_type: turn_context.session_source.to_string(),
+                                    agent_transcript_path: transcript_path,
                                     last_assistant_message: last_agent_message.clone(),
-                                },
+                                }
+                            } else {
+                                HookEvent::Stop {
+                                    stop_hook_active,
+                                    last_assistant_message: last_agent_message.clone(),
+                                }
                             },
                         })
                         .await;
 
-                    let mut abort_message = None;
+                    let mut additional_context = Vec::new();
+                    let mut blocked = None;
                     for hook_outcome in hook_outcomes {
                         let hook_name = hook_outcome.hook_name;
-                        match hook_outcome.result {
-                            HookResult::Success => {}
-                            HookResult::FailedContinue(error) => {
-                                warn!(
-                                    turn_id = %turn_context.sub_id,
-                                    hook_name = %hook_name,
-                                    error = %error,
-                                    "after_agent hook failed; continuing"
-                                );
-                            }
-                            HookResult::FailedAbort(error) => {
-                                let message = format!(
-                                    "after_agent hook '{hook_name}' failed and aborted turn completion: {error}"
-                                );
-                                warn!(
-                                    turn_id = %turn_context.sub_id,
-                                    hook_name = %hook_name,
-                                    error = %error,
-                                    "after_agent hook failed; aborting operation"
-                                );
-                                if abort_message.is_none() {
-                                    abort_message = Some(message);
-                                }
-                            }
+                        let result = hook_outcome.result;
+                        if let Some(error) = result.error.as_deref() {
+                            warn!(
+                                turn_id = %turn_context.sub_id,
+                                hook_name = %hook_name,
+                                error,
+                                "stop hook failed; continuing"
+                            );
+                        }
+                        additional_context.extend(result.additional_context);
+                        if let HookResultControl::Block { reason } = result.control {
+                            blocked = Some((hook_name, reason));
+                            break;
                         }
                     }
-                    if let Some(message) = abort_message {
-                        sess.send_event(
-                            &turn_context,
-                            EventMsg::Error(ErrorEvent {
-                                message,
-                                codex_error_info: None,
-                            }),
-                        )
-                        .await;
-                        return None;
+                    if let Some((hook_name, reason)) = blocked {
+                        stop_hook_active = true;
+                        warn!(
+                            turn_id = %turn_context.sub_id,
+                            hook_name = %hook_name,
+                            reason = %reason,
+                            "stop hook blocked stop; continuing"
+                        );
+                        let reason = reason.trim();
+                        if !reason.is_empty() {
+                            additional_context.push(reason.to_string());
+                        }
+                        sess.record_hook_context(&turn_context, &additional_context)
+                            .await;
+                        if token_limit_reached
+                            && run_auto_compact(
+                                &sess,
+                                &turn_context,
+                                InitialContextInjection::BeforeLastUserMessage,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return None;
+                        }
+                        continue;
                     }
+                    sess.record_hook_context(&turn_context, &additional_context)
+                        .await;
                     break;
                 }
                 continue;

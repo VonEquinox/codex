@@ -607,7 +607,11 @@ fn footer_from_props_lines(
     if status_line_is_active(props)
         && let Some(status_line) = &props.status_line_value
     {
-        return status_line.iter().cloned().map(ratatui::prelude::Stylize::dim).collect();
+        return status_line
+            .iter()
+            .cloned()
+            .map(ratatui::prelude::Stylize::dim)
+            .collect();
     }
     match props.mode {
         FooterMode::QuitShortcutReminder => {

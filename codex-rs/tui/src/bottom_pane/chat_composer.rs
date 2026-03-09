@@ -6409,6 +6409,59 @@ mod tests {
     }
 
     #[test]
+    fn slash_popup_hooks_for_ho_ui() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        type_chars_humanlike(&mut composer, &['/', 'h', 'o']);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 5)).expect("terminal");
+        terminal
+            .draw(|f| composer.render(f.area(), f.buffer_mut()))
+            .expect("draw composer");
+
+        insta::assert_snapshot!("slash_popup_ho", terminal.backend());
+    }
+
+    #[test]
+    fn slash_popup_hooks_for_ho_logic() {
+        use super::super::command_popup::CommandItem;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        type_chars_humanlike(&mut composer, &['/', 'h', 'o']);
+
+        match &composer.active_popup {
+            ActivePopup::Command(popup) => match popup.selected_item() {
+                Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "hooks"),
+                Some(CommandItem::UserPrompt(_)) => {
+                    panic!("unexpected prompt selected for '/ho'")
+                }
+                None => panic!("no selected command for '/ho'"),
+            },
+            _ => panic!("slash popup not active after typing '/ho'"),
+        }
+    }
+
+    #[test]
     fn slash_popup_model_first_for_mo_logic() {
         use super::super::command_popup::CommandItem;
         let (tx, _rx) = unbounded_channel::<AppEvent>();

@@ -218,6 +218,155 @@ impl AgentControl {
         Ok(new_thread.thread_id)
     }
 
+    pub(crate) async fn spawn_agent_thread(
+        &self,
+        config: crate::config::Config,
+        session_source: Option<SessionSource>,
+    ) -> CodexResult<(ThreadId, Option<SessionSource>)> {
+        self.spawn_agent_thread_with_options(config, session_source, SpawnAgentOptions::default())
+            .await
+    }
+
+    pub(crate) async fn spawn_agent_thread_with_options(
+        &self,
+        config: crate::config::Config,
+        session_source: Option<SessionSource>,
+        options: SpawnAgentOptions,
+    ) -> CodexResult<(ThreadId, Option<SessionSource>)> {
+        let state = self.upgrade()?;
+        let mut reservation = self.state.reserve_spawn_slot(config.agent_max_threads)?;
+        let session_source = match session_source {
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth,
+                agent_role,
+                ..
+            })) => {
+                let candidate_names = agent_nickname_candidates(&config, agent_role.as_deref());
+                let candidate_name_refs: Vec<&str> =
+                    candidate_names.iter().map(String::as_str).collect();
+                let agent_nickname = reservation.reserve_agent_nickname(&candidate_name_refs)?;
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth,
+                    agent_nickname: Some(agent_nickname),
+                    agent_role,
+                }))
+            }
+            other => other,
+        };
+        let notification_source = session_source.clone();
+        let inherited_shell_snapshot = self
+            .inherited_shell_snapshot_for_source(&state, session_source.as_ref())
+            .await;
+
+        let new_thread = match session_source {
+            Some(session_source) => {
+                if let Some(call_id) = options.fork_parent_spawn_call_id.as_ref() {
+                    let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                        parent_thread_id,
+                        ..
+                    }) = session_source.clone()
+                    else {
+                        return Err(CodexErr::Fatal(
+                            "spawn_agent fork requires a thread-spawn session source".to_string(),
+                        ));
+                    };
+                    let parent_thread = state.get_thread(parent_thread_id).await.ok();
+                    if let Some(parent_thread) = parent_thread.as_ref() {
+                        parent_thread
+                            .codex
+                            .session
+                            .ensure_rollout_materialized()
+                            .await;
+                        parent_thread.codex.session.flush_rollout().await;
+                    }
+                    let rollout_path = parent_thread
+                        .as_ref()
+                        .and_then(|parent_thread| parent_thread.rollout_path())
+                        .or(find_thread_path_by_id_str(
+                            config.codex_home.as_path(),
+                            &parent_thread_id.to_string(),
+                        )
+                        .await?)
+                        .ok_or_else(|| {
+                            CodexErr::Fatal(format!(
+                                "parent thread rollout unavailable for fork: {parent_thread_id}"
+                            ))
+                        })?;
+                    let mut forked_rollout_items =
+                        RolloutRecorder::get_rollout_history(&rollout_path)
+                            .await?
+                            .get_rollout_items();
+                    let mut output = FunctionCallOutputPayload::from_text(
+                        FORKED_SPAWN_AGENT_OUTPUT_MESSAGE.to_string(),
+                    );
+                    output.success = Some(true);
+                    forked_rollout_items.push(RolloutItem::ResponseItem(
+                        ResponseItem::FunctionCallOutput {
+                            call_id: call_id.clone(),
+                            output,
+                        },
+                    ));
+                    let initial_history = InitialHistory::Forked(forked_rollout_items);
+                    state
+                        .fork_thread_with_source(
+                            config,
+                            initial_history,
+                            self.clone(),
+                            session_source,
+                            false,
+                            inherited_shell_snapshot,
+                        )
+                        .await?
+                } else {
+                    state
+                        .spawn_new_thread_with_source(
+                            config,
+                            self.clone(),
+                            session_source,
+                            false,
+                            None,
+                            inherited_shell_snapshot,
+                        )
+                        .await?
+                }
+            }
+            None => state.spawn_new_thread(config, self.clone()).await?,
+        };
+        reservation.commit(new_thread.thread_id);
+        state.notify_thread_created(new_thread.thread_id);
+        Ok((new_thread.thread_id, notification_source))
+    }
+
+    pub(crate) async fn send_spawn_input(
+        &self,
+        agent_id: ThreadId,
+        items: Vec<UserInput>,
+        notification_source: Option<SessionSource>,
+    ) -> CodexResult<String> {
+        let result = self.send_input(agent_id, items).await;
+        if result.is_ok() {
+            self.maybe_start_completion_watcher(agent_id, notification_source);
+        }
+        result
+    }
+
+    pub(crate) async fn inject_developer_message_without_turn(
+        &self,
+        agent_id: ThreadId,
+        message: String,
+    ) -> CodexResult<()> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(agent_id).await?;
+        thread.inject_developer_message_without_turn(message).await;
+        Ok(())
+    }
+
+    pub(crate) fn spawned_thread_ids(&self) -> Vec<ThreadId> {
+        self.state.spawned_thread_ids()
+    }
+
     /// Resume an existing agent thread from a recorded rollout file.
     pub(crate) async fn resume_agent_from_rollout(
         &self,

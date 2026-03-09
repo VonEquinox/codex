@@ -83,6 +83,7 @@ mod file_search;
 mod frames;
 mod get_git_diff;
 mod history_cell;
+mod hooks_config;
 pub mod insert_history;
 mod key_hint;
 mod line_truncation;

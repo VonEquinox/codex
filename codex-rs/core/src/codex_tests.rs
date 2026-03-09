@@ -2076,8 +2076,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             Arc::clone(&auth_manager),
         ),
         hooks: Hooks::new(HooksConfig {
-            legacy_notify_argv: config.notify.clone(),
+            command_hooks: Default::default(),
         }),
+        pending_hook_context: Mutex::new(Vec::new()),
         rollout: Mutex::new(None),
         user_shell: Arc::new(default_user_shell()),
         shell_snapshot_tx: watch::channel(None).0,
@@ -2483,8 +2484,9 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
             Arc::clone(&auth_manager),
         ),
         hooks: Hooks::new(HooksConfig {
-            legacy_notify_argv: config.notify.clone(),
+            command_hooks: Default::default(),
         }),
+        pending_hook_context: Mutex::new(Vec::new()),
         rollout: Mutex::new(None),
         user_shell: Arc::new(default_user_shell()),
         shell_snapshot_tx: watch::channel(None).0,

@@ -23,6 +23,8 @@ use crate::history_cell;
 use crate::history_cell::HistoryCell;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
+use crate::hooks_config;
+use crate::hooks_config::HookMutation;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
@@ -3098,6 +3100,213 @@ impl App {
             AppEvent::SelectAgentThread(thread_id) => {
                 self.select_agent_thread(tui, thread_id).await?;
             }
+            AppEvent::OpenHooksManager {
+                scope_label,
+                path,
+                seed,
+                disabled_reason,
+            } => match read_hooks_config_contents(path.as_path(), &seed).await {
+                Ok(contents) => match hooks_config::list_hook_entries(&contents) {
+                    Ok(entries) => self.chat_widget.open_hooks_manager_view(
+                        scope_label,
+                        path,
+                        seed,
+                        disabled_reason,
+                        entries,
+                    ),
+                    Err(err) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to parse {}: {err}",
+                            path.display()
+                        ));
+                        self.chat_widget.open_hooks_editor(
+                            "Edit raw config.toml".to_string(),
+                            scope_label,
+                            path,
+                            seed,
+                            disabled_reason,
+                            contents,
+                            HookMutation::ReplaceRaw {
+                                contents: String::new(),
+                            },
+                        );
+                    }
+                },
+                Err(err) => self
+                    .chat_widget
+                    .add_error_message(format!("Failed to load {}: {err}", path.display())),
+            },
+            AppEvent::OpenHooksAddEventPicker {
+                scope_label,
+                path,
+                seed,
+                disabled_reason,
+            } => {
+                self.chat_widget.open_hooks_add_event_picker(
+                    scope_label,
+                    path,
+                    seed,
+                    disabled_reason,
+                );
+            }
+            AppEvent::OpenHooksAddPrompt {
+                scope_label,
+                path,
+                seed,
+                disabled_reason,
+                event,
+            } => {
+                let template = hooks_config::template_for_event(&event);
+                self.chat_widget.open_hooks_editor(
+                    format!("Add {event} hook"),
+                    scope_label,
+                    path,
+                    seed,
+                    disabled_reason,
+                    template,
+                    HookMutation::Add {
+                        event,
+                        snippet: String::new(),
+                    },
+                );
+            }
+            AppEvent::OpenHooksEntryActions {
+                scope_label,
+                path,
+                seed,
+                disabled_reason,
+                id,
+                title,
+            } => {
+                self.chat_widget.open_hooks_entry_actions(
+                    scope_label,
+                    path,
+                    seed,
+                    disabled_reason,
+                    id,
+                    title,
+                );
+            }
+            AppEvent::OpenHooksEditPrompt {
+                scope_label,
+                path,
+                seed,
+                disabled_reason,
+                id,
+                title,
+            } => match read_hooks_config_contents(path.as_path(), &seed).await {
+                Ok(contents) => {
+                    match hooks_config::editor_seed_for_entry(&id.event, id.index, &contents) {
+                        Ok(initial_text) => self.chat_widget.open_hooks_editor(
+                            format!("Edit {title}"),
+                            scope_label,
+                            path,
+                            seed,
+                            disabled_reason,
+                            initial_text,
+                            HookMutation::Replace {
+                                id,
+                                snippet: String::new(),
+                            },
+                        ),
+                        Err(err) => self
+                            .chat_widget
+                            .add_error_message(format!("Failed to load hook {title}: {err}")),
+                    }
+                }
+                Err(err) => self
+                    .chat_widget
+                    .add_error_message(format!("Failed to load {}: {err}", path.display())),
+            },
+            AppEvent::OpenHooksDeleteConfirm {
+                scope_label,
+                path,
+                seed,
+                disabled_reason,
+                id,
+                title,
+            } => {
+                self.chat_widget.open_hooks_delete_confirm(
+                    scope_label,
+                    path,
+                    seed,
+                    disabled_reason,
+                    id,
+                    title,
+                );
+            }
+            AppEvent::OpenHooksRawEditor {
+                scope_label,
+                path,
+                seed,
+                disabled_reason,
+            } => match read_hooks_config_contents(path.as_path(), &seed).await {
+                Ok(contents) => self.chat_widget.open_hooks_editor(
+                    "Edit raw config.toml".to_string(),
+                    scope_label,
+                    path,
+                    seed,
+                    disabled_reason,
+                    contents,
+                    HookMutation::ReplaceRaw {
+                        contents: String::new(),
+                    },
+                ),
+                Err(err) => self
+                    .chat_widget
+                    .add_error_message(format!("Failed to load {}: {err}", path.display())),
+            },
+            AppEvent::ApplyHooksMutation {
+                scope_label,
+                path,
+                seed,
+                disabled_reason,
+                mutation,
+            } => match read_hooks_config_contents(path.as_path(), &seed).await {
+                Ok(contents) => match hooks_config::apply_mutation(&contents, mutation.clone()) {
+                    Ok(updated_contents) => {
+                        match write_hooks_config_contents(path.as_path(), &updated_contents).await {
+                            Ok(()) => match hooks_config::list_hook_entries(&updated_contents) {
+                                Ok(entries) => self.chat_widget.open_hooks_manager_view(
+                                    scope_label,
+                                    path,
+                                    seed,
+                                    disabled_reason,
+                                    entries,
+                                ),
+                                Err(err) => self.chat_widget.add_error_message(format!(
+                                    "Failed to parse updated hooks config {}: {err}",
+                                    path.display()
+                                )),
+                            },
+                            Err(err) => self.chat_widget.add_error_message(format!(
+                                "Failed to save {}: {err}",
+                                path.display()
+                            )),
+                        }
+                    }
+                    Err(err) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to update hooks config {}: {err}",
+                            path.display()
+                        ));
+                        if let Some(editor_text) = mutation_editor_text(&mutation) {
+                            self.chat_widget.open_hooks_editor(
+                                hooks_editor_title(&mutation),
+                                scope_label,
+                                path,
+                                seed,
+                                disabled_reason,
+                                editor_text,
+                                mutation,
+                            );
+                        }
+                    }
+                },
+                Err(err) => self
+                    .chat_widget
+                    .add_error_message(format!("Failed to load {}: {err}", path.display())),
+            },
             AppEvent::OpenSkillsList => {
                 self.chat_widget.open_skills_list();
             }
@@ -3731,6 +3940,39 @@ impl App {
                 });
             }
         });
+    }
+}
+
+async fn read_hooks_config_contents(path: &Path, seed: &str) -> std::io::Result<String> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) => Ok(contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(seed.to_string()),
+        Err(err) => Err(err),
+    }
+}
+
+async fn write_hooks_config_contents(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, contents).await
+}
+
+fn hooks_editor_title(mutation: &HookMutation) -> String {
+    match mutation {
+        HookMutation::Add { event, .. } => format!("Add {event} hook"),
+        HookMutation::Replace { .. } => "Edit hook".to_string(),
+        HookMutation::Delete { .. } => "Delete hook".to_string(),
+        HookMutation::ReplaceRaw { .. } => "Edit raw config.toml".to_string(),
+    }
+}
+
+fn mutation_editor_text(mutation: &HookMutation) -> Option<String> {
+    match mutation {
+        HookMutation::Add { snippet, .. } => Some(snippet.clone()),
+        HookMutation::Replace { snippet, .. } => Some(snippet.clone()),
+        HookMutation::Delete { .. } => None,
+        HookMutation::ReplaceRaw { contents } => Some(contents.clone()),
     }
 }
 

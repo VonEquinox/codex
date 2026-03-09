@@ -21,6 +21,9 @@ use std::collections::HashSet;
 const COLLAB_PROMPT_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_RESPONSE_PREVIEW_GRAPHEMES: usize = 240;
+const TEAM_SPAWN_CALL_PREFIX: &str = "team/spawn:";
+const TEAM_WAIT_CALL_PREFIX: &str = "team/wait:";
+const TEAM_CLOSE_CALL_PREFIX: &str = "team/close:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum AgentPickerBadge {
@@ -66,6 +69,13 @@ struct AgentLabel<'a> {
     thread_id: Option<ThreadId>,
     nickname: Option<&'a str>,
     role: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamCallKind {
+    Spawn,
+    Wait,
+    Close,
 }
 
 pub(crate) fn agent_picker_status_dot_spans(is_closed: bool) -> Vec<Span<'static>> {
@@ -182,23 +192,39 @@ pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
         sender_thread_id: _,
         receiver_thread_ids,
         receiver_agents,
-        call_id: _,
+        call_id,
     } = ev;
     let receiver_agents = merge_wait_receivers(&receiver_thread_ids, receiver_agents);
 
-    let title = match receiver_agents.as_slice() {
-        [receiver] => title_with_agent("Waiting for", agent_label_from_ref(receiver)),
-        [] => title_text("Waiting for agents"),
-        _ => title_text(format!("Waiting for {} agents", receiver_agents.len())),
-    };
-
-    let details = if receiver_agents.len() > 1 {
-        receiver_agents
-            .iter()
-            .map(|receiver| agent_label_line(agent_label_from_ref(receiver)))
-            .collect()
-    } else {
-        Vec::new()
+    let (title, details) = match team_call_kind(&call_id) {
+        Some(TeamCallKind::Spawn) => (
+            title_text("Creating agent team"),
+            team_agent_details(&receiver_agents),
+        ),
+        Some(TeamCallKind::Wait) => (
+            title_text("Waiting for agent team"),
+            team_agent_details(&receiver_agents),
+        ),
+        Some(TeamCallKind::Close) => (
+            title_text("Closing agent team"),
+            team_agent_details(&receiver_agents),
+        ),
+        None => {
+            let title = match receiver_agents.as_slice() {
+                [receiver] => title_with_agent("Waiting for", agent_label_from_ref(receiver)),
+                [] => title_text("Waiting for agents"),
+                _ => title_text(format!("Waiting for {} agents", receiver_agents.len())),
+            };
+            let details = if receiver_agents.len() > 1 {
+                receiver_agents
+                    .iter()
+                    .map(|receiver| agent_label_line(agent_label_from_ref(receiver)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (title, details)
+        }
     };
 
     collab_event(title, details)
@@ -206,13 +232,19 @@ pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
 
 pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
     let CollabWaitingEndEvent {
-        call_id: _,
+        call_id,
         sender_thread_id: _,
         agent_statuses,
         statuses,
     } = ev;
     let details = wait_complete_lines(&statuses, &agent_statuses);
-    collab_event(title_text("Finished waiting"), details)
+    let title = match team_call_kind(&call_id) {
+        Some(TeamCallKind::Spawn) => title_text("Created agent team"),
+        Some(TeamCallKind::Wait) => title_text("Finished waiting for agent team"),
+        Some(TeamCallKind::Close) => title_text("Closed agent team"),
+        None => title_text("Finished waiting"),
+    };
+    collab_event(title, details)
 }
 
 pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
@@ -314,6 +346,25 @@ fn agent_label_from_ref(agent: &CollabAgentRef) -> AgentLabel<'_> {
         nickname: agent.agent_nickname.as_deref(),
         role: agent.agent_role.as_deref(),
     }
+}
+
+fn team_call_kind(call_id: &str) -> Option<TeamCallKind> {
+    if call_id.starts_with(TEAM_SPAWN_CALL_PREFIX) {
+        Some(TeamCallKind::Spawn)
+    } else if call_id.starts_with(TEAM_WAIT_CALL_PREFIX) {
+        Some(TeamCallKind::Wait)
+    } else if call_id.starts_with(TEAM_CLOSE_CALL_PREFIX) {
+        Some(TeamCallKind::Close)
+    } else {
+        None
+    }
+}
+
+fn team_agent_details(receiver_agents: &[CollabAgentRef]) -> Vec<Line<'static>> {
+    receiver_agents
+        .iter()
+        .map(|receiver| agent_label_line(agent_label_from_ref(receiver)))
+        .collect()
 }
 
 fn agent_label_line(agent: AgentLabel<'_>) -> Line<'static> {
@@ -604,6 +655,52 @@ mod tests {
         assert_eq!(title.spans[4].content.as_ref(), "[explorer]");
         assert_eq!(title.spans[4].style.fg, None);
         assert!(!title.spans[4].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn team_spawn_waiting_end_uses_team_title() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let planner_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid planner thread id");
+        let mut statuses = HashMap::new();
+        statuses.insert(planner_id, AgentStatus::Completed(None));
+
+        let cell = waiting_end(CollabWaitingEndEvent {
+            call_id: "team/spawn:call-team".to_string(),
+            sender_thread_id,
+            agent_statuses: vec![CollabAgentStatusEntry {
+                thread_id: planner_id,
+                agent_nickname: Some("planner".to_string()),
+                agent_role: Some("develop".to_string()),
+                status: AgentStatus::Completed(None),
+            }],
+            statuses,
+        });
+
+        assert_snapshot!("collab_team_spawn_end", cell_to_text(&cell));
+    }
+
+    #[test]
+    fn team_close_waiting_begin_uses_team_title() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let planner_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid planner thread id");
+        let cell = waiting_begin(CollabWaitingBeginEvent {
+            sender_thread_id,
+            receiver_thread_ids: vec![planner_id],
+            receiver_agents: vec![CollabAgentRef {
+                thread_id: planner_id,
+                agent_nickname: Some("planner".to_string()),
+                agent_role: Some("develop".to_string()),
+            }],
+            call_id: "team/close:call-team".to_string(),
+        });
+
+        let text = cell_to_text(&cell);
+        assert!(text.contains("Closing agent team"));
+        assert!(text.contains("planner [develop]"));
     }
 
     fn cell_to_text(cell: &PlainHistoryCell) -> String {

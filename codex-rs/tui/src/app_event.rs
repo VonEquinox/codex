@@ -21,6 +21,8 @@ use codex_utils_approval_presets::ApprovalPreset;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::history_cell::HistoryCell;
+use crate::hooks_config::HookId;
+use crate::hooks_config::HookMutation;
 
 use codex_core::features::Feature;
 use codex_protocol::config_types::CollaborationModeMask;
@@ -356,6 +358,78 @@ pub(crate) enum AppEvent {
 
     /// Re-open the approval presets popup.
     OpenApprovalsPopup,
+
+    /// Open hooks manager for the selected config layer.
+    OpenHooksManager {
+        scope_label: String,
+        path: PathBuf,
+        seed: String,
+        disabled_reason: Option<String>,
+    },
+
+    /// Open the event picker for adding a hook.
+    OpenHooksAddEventPicker {
+        scope_label: String,
+        path: PathBuf,
+        seed: String,
+        disabled_reason: Option<String>,
+    },
+
+    /// Open the add-hook editor for a specific event.
+    OpenHooksAddPrompt {
+        scope_label: String,
+        path: PathBuf,
+        seed: String,
+        disabled_reason: Option<String>,
+        event: String,
+    },
+
+    /// Open the per-entry actions menu for a hook.
+    OpenHooksEntryActions {
+        scope_label: String,
+        path: PathBuf,
+        seed: String,
+        disabled_reason: Option<String>,
+        id: HookId,
+        title: String,
+    },
+
+    /// Open the editor for a single hook entry.
+    OpenHooksEditPrompt {
+        scope_label: String,
+        path: PathBuf,
+        seed: String,
+        disabled_reason: Option<String>,
+        id: HookId,
+        title: String,
+    },
+
+    /// Open the delete confirmation for a single hook entry.
+    OpenHooksDeleteConfirm {
+        scope_label: String,
+        path: PathBuf,
+        seed: String,
+        disabled_reason: Option<String>,
+        id: HookId,
+        title: String,
+    },
+
+    /// Open the raw config editor for hooks.
+    OpenHooksRawEditor {
+        scope_label: String,
+        path: PathBuf,
+        seed: String,
+        disabled_reason: Option<String>,
+    },
+
+    /// Apply a hooks config mutation and reopen the manager.
+    ApplyHooksMutation {
+        scope_label: String,
+        path: PathBuf,
+        seed: String,
+        disabled_reason: Option<String>,
+        mutation: HookMutation,
+    },
 
     /// Open the skills list popup.
     OpenSkillsList,

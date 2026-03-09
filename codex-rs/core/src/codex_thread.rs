@@ -128,6 +128,32 @@ impl CodexThread {
             .await;
     }
 
+    pub(crate) async fn inject_developer_message_without_turn(&self, message: String) {
+        let pending_item = ResponseInputItem::Message {
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText { text: message }],
+        };
+        let pending_items = vec![pending_item];
+        let Err(items_without_active_turn) = self
+            .codex
+            .session
+            .inject_response_items(pending_items)
+            .await
+        else {
+            return;
+        };
+
+        let turn_context = self.codex.session.new_default_turn().await;
+        let items: Vec<ResponseItem> = items_without_active_turn
+            .into_iter()
+            .map(ResponseItem::from)
+            .collect();
+        self.codex
+            .session
+            .record_conversation_items(turn_context.as_ref(), &items)
+            .await;
+    }
+
     pub fn rollout_path(&self) -> Option<PathBuf> {
         self.rollout_path.clone()
     }

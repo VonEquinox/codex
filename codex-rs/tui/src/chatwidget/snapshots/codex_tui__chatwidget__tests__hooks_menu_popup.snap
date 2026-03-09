@@ -1,0 +1,11 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: popup
+---
+  Hooks
+  Choose a config.toml layer to manage.
+
+› 1. Global hooks (user)                 /home/user/.codex/config.toml
+  2. Project hooks (/home/user/project)  /home/user/project/.codex/config.toml
+
+  Press enter to confirm or esc to go back
