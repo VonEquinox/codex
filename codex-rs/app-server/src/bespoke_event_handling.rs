@@ -804,6 +804,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids: Vec::new(),
                 prompt: Some(begin_event.prompt),
                 agents_states: HashMap::new(),
+                error: None,
             };
             let notification = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
@@ -841,6 +842,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids,
                 prompt: Some(end_event.prompt),
                 agents_states,
+                error: None,
             };
             let notification = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
@@ -861,6 +863,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids,
                 prompt: Some(begin_event.prompt),
                 agents_states: HashMap::new(),
+                error: None,
             };
             let notification = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
@@ -887,6 +890,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids: vec![receiver_id.clone()],
                 prompt: Some(end_event.prompt),
                 agents_states: [(receiver_id, received_status)].into_iter().collect(),
+                error: None,
             };
             let notification = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
@@ -911,6 +915,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids,
                 prompt: None,
                 agents_states: HashMap::new(),
+                error: None,
             };
             let notification = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
@@ -922,18 +927,21 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::CollabWaitingEnd(end_event) => {
-            let status = if end_event.statuses.values().any(|status| {
-                matches!(
-                    status,
-                    codex_protocol::protocol::AgentStatus::Errored(_)
-                        | codex_protocol::protocol::AgentStatus::NotFound
-                )
-            }) {
+            let status = if end_event.failure_reason.is_some()
+                || end_event.statuses.values().any(|status| {
+                    matches!(
+                        status,
+                        codex_protocol::protocol::AgentStatus::Errored(_)
+                            | codex_protocol::protocol::AgentStatus::NotFound
+                    )
+                }) {
                 V2CollabToolCallStatus::Failed
             } else {
                 V2CollabToolCallStatus::Completed
             };
-            let receiver_thread_ids = end_event.statuses.keys().map(ToString::to_string).collect();
+            let mut receiver_thread_ids: Vec<String> =
+                end_event.statuses.keys().map(ToString::to_string).collect();
+            receiver_thread_ids.sort();
             let agents_states = end_event
                 .statuses
                 .iter()
@@ -947,6 +955,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids,
                 prompt: None,
                 agents_states,
+                error: end_event.failure_reason,
             };
             let notification = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
@@ -966,6 +975,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids: vec![begin_event.receiver_thread_id.to_string()],
                 prompt: None,
                 agents_states: HashMap::new(),
+                error: None,
             };
             let notification = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
@@ -1006,6 +1016,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids: vec![receiver_id],
                 prompt: None,
                 agents_states,
+                error: None,
             };
             let notification = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
@@ -2364,6 +2375,7 @@ fn collab_resume_begin_item(
         receiver_thread_ids: vec![begin_event.receiver_thread_id.to_string()],
         prompt: None,
         agents_states: HashMap::new(),
+        error: None,
     }
 }
 
@@ -2388,6 +2400,7 @@ fn collab_resume_end_item(end_event: codex_protocol::protocol::CollabResumeEndEv
         receiver_thread_ids: vec![receiver_id],
         prompt: None,
         agents_states,
+        error: None,
     }
 }
 
@@ -2555,6 +2568,7 @@ mod tests {
             receiver_thread_ids: vec![event.receiver_thread_id.to_string()],
             prompt: None,
             agents_states: HashMap::new(),
+            error: None,
         };
         assert_eq!(item, expected);
     }
@@ -2585,6 +2599,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            error: None,
         };
         assert_eq!(item, expected);
     }

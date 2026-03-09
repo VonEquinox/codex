@@ -554,6 +554,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: Vec::new(),
             prompt: Some(payload.prompt.clone()),
             agents_states: HashMap::new(),
+            error: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -587,6 +588,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids,
             prompt: Some(payload.prompt.clone()),
             agents_states,
+            error: None,
         });
     }
 
@@ -602,6 +604,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
             prompt: Some(payload.prompt.clone()),
             agents_states: HashMap::new(),
+            error: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -624,6 +627,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![receiver_id.clone()],
             prompt: Some(payload.prompt.clone()),
             agents_states: [(receiver_id, received_status)].into_iter().collect(),
+            error: None,
         });
     }
 
@@ -643,6 +647,7 @@ impl ThreadHistoryBuilder {
                 .collect(),
             prompt: None,
             agents_states: HashMap::new(),
+            error: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -651,10 +656,11 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabWaitingEndEvent,
     ) {
-        let status = if payload
-            .statuses
-            .values()
-            .any(|status| matches!(status, AgentStatus::Errored(_) | AgentStatus::NotFound))
+        let status = if payload.failure_reason.is_some()
+            || payload
+                .statuses
+                .values()
+                .any(|status| matches!(status, AgentStatus::Errored(_) | AgentStatus::NotFound))
         {
             CollabAgentToolCallStatus::Failed
         } else {
@@ -676,6 +682,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids,
             prompt: None,
             agents_states,
+            error: payload.failure_reason.clone(),
         });
     }
 
@@ -691,6 +698,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
             prompt: None,
             agents_states: HashMap::new(),
+            error: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -715,6 +723,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![receiver_id],
             prompt: None,
             agents_states,
+            error: None,
         });
     }
 
@@ -730,6 +739,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
             prompt: None,
             agents_states: HashMap::new(),
+            error: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -757,6 +767,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![receiver_id],
             prompt: None,
             agents_states,
+            error: None,
         });
     }
 
@@ -2333,6 +2344,78 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_collab_wait_end_item_with_failure_reason() {
+        let sender_thread_id =
+            ThreadId::try_from("00000000-0000-0000-0000-000000000001").expect("valid sender");
+        let receiver_a =
+            ThreadId::try_from("00000000-0000-0000-0000-000000000003").expect("valid receiver");
+        let receiver_b =
+            ThreadId::try_from("00000000-0000-0000-0000-000000000002").expect("valid receiver");
+        let events = vec![
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "hello".into(),
+                images: Some(Vec::new()),
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            }),
+            EventMsg::CollabWaitingEnd(codex_protocol::protocol::CollabWaitingEndEvent {
+                sender_thread_id,
+                call_id: "wait-1".into(),
+                agent_statuses: Vec::new(),
+                statuses: [
+                    (receiver_a, AgentStatus::Completed(None)),
+                    (receiver_b, AgentStatus::Completed(None)),
+                ]
+                .into_iter()
+                .collect(),
+                failure_reason: Some("teammate_idle hook blocked".into()),
+            }),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::CollabAgentToolCall {
+                id: "wait-1".into(),
+                tool: CollabAgentTool::Wait,
+                status: CollabAgentToolCallStatus::Failed,
+                sender_thread_id: "00000000-0000-0000-0000-000000000001".into(),
+                receiver_thread_ids: vec![
+                    "00000000-0000-0000-0000-000000000002".into(),
+                    "00000000-0000-0000-0000-000000000003".into(),
+                ],
+                prompt: None,
+                agents_states: [
+                    (
+                        "00000000-0000-0000-0000-000000000002".into(),
+                        CollabAgentState {
+                            status: crate::protocol::v2::CollabAgentStatus::Completed,
+                            message: None,
+                        },
+                    ),
+                    (
+                        "00000000-0000-0000-0000-000000000003".into(),
+                        CollabAgentState {
+                            status: crate::protocol::v2::CollabAgentStatus::Completed,
+                            message: None,
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                error: Some("teammate_idle hook blocked".into()),
             }
         );
     }

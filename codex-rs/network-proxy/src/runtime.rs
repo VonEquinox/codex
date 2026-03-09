@@ -828,13 +828,13 @@ mod tests {
     #[tokio::test]
     async fn host_blocked_denied_wins_over_allowed() {
         let state = network_proxy_state_for_policy(NetworkProxySettings {
-            allowed_domains: vec!["example.com".to_string()],
-            denied_domains: vec!["example.com".to_string()],
+            allowed_domains: vec!["example.invalid".to_string()],
+            denied_domains: vec!["example.invalid".to_string()],
             ..NetworkProxySettings::default()
         });
 
         assert_eq!(
-            state.host_blocked("example.com", 80).await.unwrap(),
+            state.host_blocked("example.invalid", 80).await.unwrap(),
             HostBlockDecision::Blocked(HostBlockReason::Denied)
         );
     }
@@ -842,12 +842,13 @@ mod tests {
     #[tokio::test]
     async fn host_blocked_requires_allowlist_match() {
         let state = network_proxy_state_for_policy(NetworkProxySettings {
-            allowed_domains: vec!["example.com".to_string()],
+            allowed_domains: vec!["example.invalid".to_string()],
+            allow_local_binding: true,
             ..NetworkProxySettings::default()
         });
 
         assert_eq!(
-            state.host_blocked("example.com", 80).await.unwrap(),
+            state.host_blocked("example.invalid", 80).await.unwrap(),
             HostBlockDecision::Allowed
         );
         assert_eq!(
@@ -861,17 +862,18 @@ mod tests {
     #[tokio::test]
     async fn add_allowed_domain_removes_matching_deny_entry() {
         let state = network_proxy_state_for_policy(NetworkProxySettings {
-            denied_domains: vec!["example.com".to_string()],
+            denied_domains: vec!["example.invalid".to_string()],
+            allow_local_binding: true,
             ..NetworkProxySettings::default()
         });
 
-        state.add_allowed_domain("ExAmPlE.CoM").await.unwrap();
+        state.add_allowed_domain("ExAmPlE.InVaLiD").await.unwrap();
 
         let (allowed, denied) = state.current_patterns().await.unwrap();
-        assert_eq!(allowed, vec!["example.com".to_string()]);
+        assert_eq!(allowed, vec!["example.invalid".to_string()]);
         assert!(denied.is_empty());
         assert_eq!(
-            state.host_blocked("example.com", 80).await.unwrap(),
+            state.host_blocked("example.invalid", 80).await.unwrap(),
             HostBlockDecision::Allowed
         );
     }
@@ -879,17 +881,17 @@ mod tests {
     #[tokio::test]
     async fn add_denied_domain_removes_matching_allow_entry() {
         let state = network_proxy_state_for_policy(NetworkProxySettings {
-            allowed_domains: vec!["example.com".to_string()],
+            allowed_domains: vec!["example.invalid".to_string()],
             ..NetworkProxySettings::default()
         });
 
-        state.add_denied_domain("EXAMPLE.COM").await.unwrap();
+        state.add_denied_domain("EXAMPLE.INVALID").await.unwrap();
 
         let (allowed, denied) = state.current_patterns().await.unwrap();
         assert!(allowed.is_empty());
-        assert_eq!(denied, vec!["example.com".to_string()]);
+        assert_eq!(denied, vec!["example.invalid".to_string()]);
         assert_eq!(
-            state.host_blocked("example.com", 80).await.unwrap(),
+            state.host_blocked("example.invalid", 80).await.unwrap(),
             HostBlockDecision::Blocked(HostBlockReason::Denied)
         );
     }
@@ -1075,16 +1077,17 @@ mod tests {
     #[tokio::test]
     async fn host_blocked_subdomain_wildcards_exclude_apex() {
         let state = network_proxy_state_for_policy(NetworkProxySettings {
-            allowed_domains: vec!["*.openai.com".to_string()],
+            allowed_domains: vec!["*.openai.invalid".to_string()],
+            allow_local_binding: true,
             ..NetworkProxySettings::default()
         });
 
         assert_eq!(
-            state.host_blocked("api.openai.com", 80).await.unwrap(),
+            state.host_blocked("api.openai.invalid", 80).await.unwrap(),
             HostBlockDecision::Allowed
         );
         assert_eq!(
-            state.host_blocked("openai.com", 80).await.unwrap(),
+            state.host_blocked("openai.invalid", 80).await.unwrap(),
             HostBlockDecision::Blocked(HostBlockReason::NotAllowed)
         );
     }

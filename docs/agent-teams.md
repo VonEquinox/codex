@@ -47,9 +47,10 @@ Notes:
 When `spawn_team` succeeds, Codex persists:
 
 - Team config: `$CODEX_HOME/teams/<team_id>/config.json`
+- Team lifecycle lock: `$CODEX_HOME/teams/<team_id>/team.lock`
 - Initial tasks: `$CODEX_HOME/tasks/<team_id>/*.json`
 - Durable inbox (per thread): `$CODEX_HOME/teams/<team_id>/inbox/<thread_id>.jsonl`
-- Durable inbox cursor: `$CODEX_HOME/teams/<team_id>/inbox/<thread_id>.cursor.json`
+- Durable inbox state: `$CODEX_HOME/teams/<team_id>/inbox/<thread_id>.state.json`
 - Durable inbox lock: `$CODEX_HOME/teams/<team_id>/inbox/<thread_id>.lock`
 - Tasks lock: `$CODEX_HOME/tasks/<team_id>/tasks.lock`
 - Worktree lease (only for `worktree: true` members): `$CODEX_HOME/worktrees/leases/<agent_id>.json`
@@ -57,13 +58,27 @@ When `spawn_team` succeeds, Codex persists:
 `close_team` updates the persisted team config to reflect the remaining members. `team_cleanup`
 removes the persisted team config/tasks after every member is closed.
 
-If `close_team` closes every member, Codex intentionally keeps an empty team record on disk until
-`team_cleanup` runs. That preserves restart-safe cleanup for tasks, inbox state, and worktree
-leases.
+If `close_team` closes every member, Codex leaves the team in a `cleanup_pending` state on disk
+until `team_cleanup` runs. That preserves restart-safe cleanup for tasks, inbox state, and worktree
+leases while still blocking new team operations on a closed team.
 
-Lead-side tools (`wait_team`, `close_team`, `team_message`, `team_broadcast`) rebuild the in-memory
-team registry lazily from `config.json` after a CLI/process restart. Worktree cleanup also falls
-back to the persisted lease when the in-memory lease registry is empty.
+Lead-side tools (`wait_team`, `close_team`, `team_broadcast`) rebuild the in-memory team registry
+lazily from `config.json` after a CLI/process restart. `team_message` can now be used by the lead
+or by a teammate to reach another teammate. Worktree cleanup also falls back to the persisted lease
+when the in-memory lease registry is empty.
+
+## Coordination model
+
+- `spawn_team` attempts to bootstrap every teammate with durable team context: team id, lead
+  identity, roster, task/message/inbox workflow, and the rule that teammates must not spawn
+  nested teams.
+- The lead should decompose work into clear owned slices, then use `team_task_*`,
+  `team_message`, and `team_broadcast` to coordinate.
+- Teammates should use `team_task_claim` / `team_task_claim_next` before starting unclaimed work,
+  `team_task_complete` when their slice is done, `team_message` for peer handoffs, and
+  `team_ask_lead` for blockers or scope changes.
+- After a restart, `resume_agent` re-injects the same bootstrap context so resumed teammates can
+  continue with the same operating contract.
 
 ## Task tools
 
@@ -81,16 +96,17 @@ Typical flow:
 
 ## Team messaging tools
 
-- `team_message`: send input to one member by `member_name`.
+- `team_message`: send input to one teammate by `member_name` (from the lead or from another teammate).
 - `team_broadcast`: send one message/items payload to all team members.
 - `team_ask_lead`: allow a member thread to ask the lead a question.
-- `team_inbox_pop`: pop messages from the caller's inbox (cursor-based).
+- `team_inbox_pop`: pop queued unread messages from the caller's inbox.
 - `team_inbox_ack`: acknowledge popped messages using `ack_token`.
 
 `team_message`, `team_broadcast`, and `team_ask_lead` are durable-first:
 
 1. Append the payload to the receiver's inbox JSONL.
 2. Best-effort live delivery via agent_control (delivery errors do not drop the persisted message).
+3. Successful live delivery is marked in inbox state so it does not reappear as unread later.
 
 These tools accept either `message` or `items` (not both), and optional `interrupt`.
 

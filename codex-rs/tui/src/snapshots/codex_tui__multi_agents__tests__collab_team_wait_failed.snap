@@ -1,0 +1,7 @@
+---
+source: tui/src/multi_agents.rs
+expression: cell_to_text(&cell)
+---
+• Agent team wait failed
+  └ planner [develop]: Completed
+    Failure: teammate_idle hook 'idle-guard' blocked: blocked teammate

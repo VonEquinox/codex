@@ -52,6 +52,9 @@ pub async fn handle(
 ) -> Result<ToolOutput, FunctionCallError> {
     let args: WaitTeamArgs = parse_arguments(&arguments)?;
     let team_id = normalized_team_id(&args.team_id)?;
+    let config = read_persisted_team_config(turn.config.codex_home.as_path(), &team_id).await?;
+    assert_team_lead(&team_id, &config, session.conversation_id)?;
+    assert_team_state_allows_collaboration(&team_id, config.state, "wait_team")?;
     let team = get_team_record(
         turn.config.codex_home.as_path(),
         session.conversation_id,
@@ -104,6 +107,7 @@ pub async fn handle(
                             call_id: event_call_id,
                             agent_statuses: Vec::new(),
                             statuses,
+                            failure_reason: None,
                         }
                         .into(),
                     )
@@ -130,6 +134,7 @@ pub async fn handle(
         reported_statuses.insert(member.agent_id, status);
     }
 
+    let mut failure_reason = None;
     for (agent_id, state) in &wait_result.statuses {
         if !crate::agent::status::is_final(state) {
             continue;
@@ -145,7 +150,8 @@ pub async fn handle(
             dispatch_teammate_idle_hook(session.as_ref(), turn.as_ref(), &team_id, &member.name)
                 .await
         {
-            return Err(FunctionCallError::RespondToModel(err));
+            failure_reason = Some(err);
+            break;
         }
     }
 
@@ -158,10 +164,15 @@ pub async fn handle(
                 call_id: event_call_id,
                 agent_statuses,
                 statuses: reported_statuses.clone(),
+                failure_reason: failure_reason.clone(),
             }
             .into(),
         )
         .await;
+
+    if let Some(err) = failure_reason {
+        return Err(FunctionCallError::RespondToModel(err));
+    }
 
     let mut member_statuses = Vec::with_capacity(team.members.len());
     for member in &team.members {

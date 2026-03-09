@@ -6,6 +6,8 @@ use codex_protocol::ThreadId;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
@@ -28,11 +30,18 @@ pub(super) struct TeamInboxEntry {
     pub(super) prompt: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TeamInboxEntryState {
+    Queued,
+    LiveDelivered,
+    Acked,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TeamInboxCursor {
-    acked_lines: usize,
-    last_entry_id: Option<String>,
+struct TeamInboxState {
+    entries: HashMap<String, TeamInboxEntryState>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -40,8 +49,7 @@ struct TeamInboxCursor {
 pub(super) struct TeamInboxAckToken {
     pub(super) team_id: String,
     pub(super) thread_id: String,
-    pub(super) acked_lines: usize,
-    pub(super) last_entry_id: Option<String>,
+    pub(super) entry_ids: Vec<String>,
 }
 
 pub(super) fn inbox_dir(codex_home: &Path, team_id: &str) -> PathBuf {
@@ -56,8 +64,8 @@ fn inbox_lock_path(codex_home: &Path, team_id: &str, thread_id: ThreadId) -> Pat
     inbox_dir(codex_home, team_id).join(format!("{thread_id}.lock"))
 }
 
-fn inbox_cursor_path(codex_home: &Path, team_id: &str, thread_id: ThreadId) -> PathBuf {
-    inbox_dir(codex_home, team_id).join(format!("{thread_id}.cursor.json"))
+fn inbox_state_path(codex_home: &Path, team_id: &str, thread_id: ThreadId) -> PathBuf {
+    inbox_dir(codex_home, team_id).join(format!("{thread_id}.state.json"))
 }
 
 fn inbox_error(
@@ -71,31 +79,56 @@ fn inbox_error(
     ))
 }
 
-async fn read_cursor(
+async fn read_state(
     codex_home: &Path,
     team_id: &str,
     thread_id: ThreadId,
-) -> Result<TeamInboxCursor, FunctionCallError> {
-    let cursor_path = inbox_cursor_path(codex_home, team_id, thread_id);
-    let raw = match tokio::fs::read_to_string(&cursor_path).await {
+) -> Result<TeamInboxState, FunctionCallError> {
+    let state_path = inbox_state_path(codex_home, team_id, thread_id);
+    let raw = match tokio::fs::read_to_string(&state_path).await {
         Ok(raw) => raw,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(TeamInboxCursor::default()),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(TeamInboxState::default()),
         Err(err) => return Err(inbox_error("read", team_id, thread_id, err)),
     };
 
     serde_json::from_str(&raw).map_err(|err| inbox_error("parse", team_id, thread_id, err))
 }
 
-async fn write_cursor(
+async fn write_state(
     codex_home: &Path,
     team_id: &str,
     thread_id: ThreadId,
-    cursor: &TeamInboxCursor,
+    state: &TeamInboxState,
 ) -> Result<(), FunctionCallError> {
-    let cursor_path = inbox_cursor_path(codex_home, team_id, thread_id);
-    super::write_json_atomic(&cursor_path, cursor)
+    let state_path = inbox_state_path(codex_home, team_id, thread_id);
+    super::write_json_atomic(&state_path, state)
         .await
         .map_err(|err| inbox_error("write", team_id, thread_id, err))
+}
+
+async fn existing_entry_ids(
+    codex_home: &Path,
+    team_id: &str,
+    thread_id: ThreadId,
+) -> Result<HashSet<String>, FunctionCallError> {
+    let inbox_file = match tokio::fs::File::open(inbox_path(codex_home, team_id, thread_id)).await {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(err) => return Err(inbox_error("open", team_id, thread_id, err)),
+    };
+
+    let mut reader = BufReader::new(inbox_file).lines();
+    let mut ids = HashSet::new();
+    while let Some(line) = reader
+        .next_line()
+        .await
+        .map_err(|err| inbox_error("read", team_id, thread_id, err))?
+    {
+        let entry: TeamInboxEntry = serde_json::from_str(&line)
+            .map_err(|err| inbox_error("parse", team_id, thread_id, err))?;
+        ids.insert(entry.id);
+    }
+    Ok(ids)
 }
 
 pub(super) async fn append_inbox_entry(
@@ -141,7 +174,41 @@ pub(super) async fn append_inbox_entry(
         .await
         .map_err(|err| inbox_error("append", team_id, receiver_thread_id, err))?;
 
+    let mut state = read_state(codex_home, team_id, receiver_thread_id).await?;
+    state
+        .entries
+        .insert(entry.id.clone(), TeamInboxEntryState::Queued);
+    write_state(codex_home, team_id, receiver_thread_id, &state).await?;
+
     Ok(entry.id)
+}
+
+pub(super) async fn mark_inbox_entry_live_delivered(
+    codex_home: &Path,
+    team_id: &str,
+    receiver_thread_id: ThreadId,
+    entry_id: &str,
+) -> Result<(), FunctionCallError> {
+    let inbox_dir = inbox_dir(codex_home, team_id);
+    tokio::fs::create_dir_all(&inbox_dir)
+        .await
+        .map_err(|err| inbox_error("create", team_id, receiver_thread_id, err))?;
+
+    let lock_path = inbox_lock_path(codex_home, team_id, receiver_thread_id);
+    let _lock = lock_file_exclusive(&lock_path)
+        .await
+        .map_err(|err| inbox_error("lock", team_id, receiver_thread_id, err))?;
+
+    let mut state = read_state(codex_home, team_id, receiver_thread_id).await?;
+    if !matches!(
+        state.entries.get(entry_id),
+        Some(TeamInboxEntryState::Acked)
+    ) {
+        state
+            .entries
+            .insert(entry_id.to_string(), TeamInboxEntryState::LiveDelivered);
+    }
+    write_state(codex_home, team_id, receiver_thread_id, &state).await
 }
 
 pub(super) async fn pop_inbox_entries(
@@ -160,8 +227,7 @@ pub(super) async fn pop_inbox_entries(
         .await
         .map_err(|err| inbox_error("lock", team_id, receiver_thread_id, err))?;
 
-    let cursor = read_cursor(codex_home, team_id, receiver_thread_id).await?;
-
+    let state = read_state(codex_home, team_id, receiver_thread_id).await?;
     let inbox_file =
         match tokio::fs::File::open(inbox_path(codex_home, team_id, receiver_thread_id)).await {
             Ok(file) => file,
@@ -170,26 +236,26 @@ pub(super) async fn pop_inbox_entries(
         };
 
     let mut reader = BufReader::new(inbox_file).lines();
-    let mut index = 0usize;
     let mut entries = Vec::new();
-    let mut last_entry_id = None;
-
+    let mut entry_ids = Vec::new();
     while let Some(line) = reader
         .next_line()
         .await
         .map_err(|err| inbox_error("read", team_id, receiver_thread_id, err))?
     {
-        if index < cursor.acked_lines {
-            index += 1;
+        let entry: TeamInboxEntry = serde_json::from_str(&line)
+            .map_err(|err| inbox_error("parse", team_id, receiver_thread_id, err))?;
+        let entry_state = state
+            .entries
+            .get(&entry.id)
+            .copied()
+            .unwrap_or(TeamInboxEntryState::Queued);
+        if entry_state != TeamInboxEntryState::Queued {
             continue;
         }
 
-        let entry: TeamInboxEntry = serde_json::from_str(&line)
-            .map_err(|err| inbox_error("parse", team_id, receiver_thread_id, err))?;
-        last_entry_id = Some(entry.id.clone());
+        entry_ids.push(entry.id.clone());
         entries.push(entry);
-        index += 1;
-
         if entries.len() >= limit {
             break;
         }
@@ -199,14 +265,14 @@ pub(super) async fn pop_inbox_entries(
         return Ok((entries, None));
     }
 
-    let ack_token = TeamInboxAckToken {
-        team_id: team_id.to_string(),
-        thread_id: receiver_thread_id.to_string(),
-        acked_lines: cursor.acked_lines + entries.len(),
-        last_entry_id,
-    };
-
-    Ok((entries, Some(ack_token)))
+    Ok((
+        entries,
+        Some(TeamInboxAckToken {
+            team_id: team_id.to_string(),
+            thread_id: receiver_thread_id.to_string(),
+            entry_ids,
+        }),
+    ))
 }
 
 pub(super) async fn ack_inbox(
@@ -226,67 +292,21 @@ pub(super) async fn ack_inbox(
         .await
         .map_err(|err| inbox_error("lock", team_id, receiver_thread_id, err))?;
 
-    let cursor = read_cursor(codex_home, team_id, receiver_thread_id).await?;
-    if token.acked_lines < cursor.acked_lines {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "inbox ack is not monotonic (current={}, requested={})",
-            cursor.acked_lines, token.acked_lines
-        )));
-    }
-    if token.acked_lines == cursor.acked_lines {
+    if token.entry_ids.is_empty() {
         return Ok(());
     }
 
-    if token.acked_lines > 0 && token.last_entry_id.is_none() {
-        return Err(FunctionCallError::RespondToModel(
-            "ack_token missing last_entry_id".to_string(),
-        ));
-    }
-
-    let inbox_file = tokio::fs::File::open(inbox_path(codex_home, team_id, receiver_thread_id))
-        .await
-        .map_err(|err| inbox_error("open", team_id, receiver_thread_id, err))?;
-    let mut reader = BufReader::new(inbox_file).lines();
-    let target_index = token.acked_lines - 1;
-    let mut index = 0usize;
-    let mut last_seen_id = None;
-
-    while let Some(line) = reader
-        .next_line()
-        .await
-        .map_err(|err| inbox_error("read", team_id, receiver_thread_id, err))?
-    {
-        if index == target_index {
-            let entry: TeamInboxEntry = serde_json::from_str(&line)
-                .map_err(|err| inbox_error("parse", team_id, receiver_thread_id, err))?;
-            last_seen_id = Some(entry.id);
-            break;
+    let existing_ids = existing_entry_ids(codex_home, team_id, receiver_thread_id).await?;
+    let mut state = read_state(codex_home, team_id, receiver_thread_id).await?;
+    for entry_id in &token.entry_ids {
+        if !existing_ids.contains(entry_id) {
+            return Err(FunctionCallError::RespondToModel(
+                "ack_token references missing inbox entry".to_string(),
+            ));
         }
-        index += 1;
+        state
+            .entries
+            .insert(entry_id.clone(), TeamInboxEntryState::Acked);
     }
-
-    let Some(last_seen_id) = last_seen_id else {
-        return Err(FunctionCallError::RespondToModel(
-            "ack_token references missing inbox entry".to_string(),
-        ));
-    };
-
-    if Some(&last_seen_id) != token.last_entry_id.as_ref() {
-        return Err(FunctionCallError::RespondToModel(
-            "ack_token last_entry_id mismatch".to_string(),
-        ));
-    }
-
-    write_cursor(
-        codex_home,
-        team_id,
-        receiver_thread_id,
-        &TeamInboxCursor {
-            acked_lines: token.acked_lines,
-            last_entry_id: token.last_entry_id.clone(),
-        },
-    )
-    .await?;
-
-    Ok(())
+    write_state(codex_home, team_id, receiver_thread_id, &state).await
 }

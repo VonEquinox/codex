@@ -32,6 +32,10 @@ pub async fn handle(
 ) -> Result<ToolOutput, FunctionCallError> {
     let args: CloseTeamArgs = parse_arguments(&arguments)?;
     let team_id = normalized_team_id(&args.team_id)?;
+    let _team_lock = lock_team(turn.config.codex_home.as_path(), &team_id).await?;
+    let config = read_persisted_team_config(turn.config.codex_home.as_path(), &team_id).await?;
+    assert_team_lead(&team_id, &config, session.conversation_id)?;
+    assert_team_state_allows_close(&team_id, config.state)?;
     let team = get_team_record(
         turn.config.codex_home.as_path(),
         session.conversation_id,
@@ -44,6 +48,7 @@ pub async fn handle(
         )));
     }
     let original_team = team.clone();
+    let is_partial_close = args.members.is_some();
 
     let selected_names = match args.members {
         Some(names) => {
@@ -82,6 +87,36 @@ pub async fn handle(
             "no matching team members found".to_string(),
         ));
     }
+    if is_partial_close {
+        let selected_member_ids = selected_members
+            .iter()
+            .map(|member| member.agent_id.to_string())
+            .collect::<HashSet<_>>();
+        let blocked_tasks = read_team_tasks(turn.config.codex_home.as_path(), &team_id)
+            .await?
+            .into_iter()
+            .filter(|task| {
+                task.state != PersistedTaskState::Completed
+                    && selected_member_ids.contains(&task.assignee.agent_id)
+            })
+            .map(|task| format!("{} ({})", task.title, task.id))
+            .collect::<Vec<_>>();
+        if !blocked_tasks.is_empty() {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "close_team cannot remove members with incomplete tasks: {}",
+                blocked_tasks.join(", ")
+            )));
+        }
+    }
+
+    let mut closing_config = config.clone();
+    closing_config.state = PersistedTeamState::Closing;
+    write_json_atomic(
+        &team_config_path(turn.config.codex_home.as_path(), &team_id),
+        &closing_config,
+    )
+    .await
+    .map_err(|err| team_persistence_error("write team config", &team_id, err))?;
 
     let event_call_id = prefixed_team_call_id(TEAM_CLOSE_CALL_PREFIX, &call_id);
     let receiver_agents = team_member_refs(&selected_members);
@@ -187,6 +222,7 @@ pub async fn handle(
                 turn.config.codex_home.as_path(),
                 session.conversation_id,
                 &team_id,
+                PersistedTeamState::Active,
                 team,
                 None,
             )
@@ -200,6 +236,7 @@ pub async fn handle(
                 turn.config.codex_home.as_path(),
                 session.conversation_id,
                 &team_id,
+                PersistedTeamState::CleanupPending,
                 &empty_team,
                 None,
             )
@@ -209,6 +246,17 @@ pub async fn handle(
             let _ = restore_team_record(session.conversation_id, &team_id, original_team);
             persistence_error = Some(err);
         }
+    } else if let Err(err) = write_json_atomic(
+        &team_config_path(turn.config.codex_home.as_path(), &team_id),
+        &PersistedTeamConfig {
+            state: PersistedTeamState::Active,
+            ..config
+        },
+    )
+    .await
+    .map_err(|err| team_persistence_error("write team config", &team_id, err))
+    {
+        persistence_error = Some(err);
     };
 
     let agent_statuses = team_member_status_entries(&selected_members, &statuses);
@@ -220,6 +268,7 @@ pub async fn handle(
                 call_id: event_call_id,
                 agent_statuses,
                 statuses,
+                failure_reason: None,
             }
             .into(),
         )

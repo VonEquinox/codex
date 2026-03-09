@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::next_thread_spawn_depth;
+use crate::agent::role::apply_role_to_config;
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
@@ -113,11 +114,39 @@ async fn try_resume_closed_agent(
     receiver_thread_id: ThreadId,
     child_depth: i32,
 ) -> Result<AgentStatus, FunctionCallError> {
+    let mut config = build_agent_resume_config(turn.as_ref(), child_depth)?;
+    let member_metadata =
+        find_persisted_team_member(turn.config.codex_home.as_path(), receiver_thread_id).await?;
+    if let Some((team_id, team_config, member)) = member_metadata.as_ref() {
+        assert_team_state_allows_collaboration(team_id, team_config.state, "resume_agent")?;
+        let role_name = member
+            .agent_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|role| !role.is_empty());
+        apply_role_to_config(&mut config, role_name)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
+        apply_member_model_overrides(
+            &mut config,
+            member.model_provider.as_deref(),
+            member.model.as_deref(),
+        )?;
+        if member.worktree
+            && let Some(lease) =
+                read_persisted_worktree_lease(turn.config.codex_home.as_path(), receiver_thread_id)
+                    .await
+                    .map_err(FunctionCallError::RespondToModel)?
+        {
+            config.cwd = lease.worktree_path;
+        }
+    }
+
     let resume_result = session
         .services
         .agent_control
         .resume_agent_from_rollout(
-            build_agent_resume_config(turn.as_ref(), child_depth)?,
+            config.clone(),
             receiver_thread_id,
             thread_spawn_source(session.conversation_id, child_depth),
         )
@@ -132,7 +161,7 @@ async fn try_resume_closed_agent(
                     .services
                     .agent_control
                     .resume_agent_from_rollout(
-                        build_agent_resume_config(turn.as_ref(), child_depth)?,
+                        config,
                         receiver_thread_id,
                         thread_spawn_source(session.conversation_id, child_depth),
                     )
@@ -142,6 +171,25 @@ async fn try_resume_closed_agent(
         Err(err) => Err(err),
     }
     .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+
+    if member_metadata
+        .as_ref()
+        .is_some_and(|(_, _, member)| member.background)
+    {
+        maybe_start_background_agent_cleanup(session.clone(), turn.clone(), receiver_thread_id);
+    }
+
+    if let Some((team_id, team_config, member)) = member_metadata.as_ref() {
+        let injected = build_resume_team_bootstrap_message(team_id, team_config, member);
+        if let Err(err) = session
+            .services
+            .agent_control
+            .inject_developer_message_without_turn(resumed_thread_id, injected)
+            .await
+        {
+            warn!("failed to inject resumed team context: {err}");
+        }
+    }
 
     Ok(session
         .services

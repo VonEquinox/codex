@@ -41,6 +41,9 @@ pub async fn handle(
 ) -> Result<ToolOutput, FunctionCallError> {
     let args: TeamBroadcastArgs = parse_arguments(&arguments)?;
     let team_id = normalized_team_id(&args.team_id)?;
+    let config = read_persisted_team_config(turn.config.codex_home.as_path(), &team_id).await?;
+    assert_team_lead(&team_id, &config, session.conversation_id)?;
+    assert_team_state_allows_collaboration(&team_id, config.state, "team_broadcast")?;
     let team = get_team_record(
         turn.config.codex_home.as_path(),
         session.conversation_id,
@@ -88,12 +91,27 @@ pub async fn handle(
         )
         .await
         {
-            Ok(submission_id) => sent.push(TeamBroadcastSent {
-                member_name: member.name.clone(),
-                agent_id: member.agent_id.to_string(),
-                submission_id,
-                inbox_entry_id,
-            }),
+            Ok(submission_id) => {
+                if let Err(err) = inbox::mark_inbox_entry_live_delivered(
+                    turn.config.codex_home.as_path(),
+                    &team_id,
+                    member.agent_id,
+                    &inbox_entry_id,
+                )
+                .await
+                {
+                    warn!(
+                        "failed to mark inbox entry {inbox_entry_id} as live-delivered for team \
+                         {team_id}: {err}"
+                    );
+                }
+                sent.push(TeamBroadcastSent {
+                    member_name: member.name.clone(),
+                    agent_id: member.agent_id.to_string(),
+                    submission_id,
+                    inbox_entry_id,
+                });
+            }
             Err(err) => failed.push(TeamBroadcastFailed {
                 member_name: member.name.clone(),
                 agent_id: member.agent_id.to_string(),

@@ -9500,7 +9500,7 @@ async fn status_line_context_remaining_prefers_config_full_window_and_default_co
 
     assert_eq!(
         status_line_text(&chat),
-        Some("Full [████████] 258K · Compact [████████] 231K".to_string())
+        Some("Full [████████] 245K · Compact [████████] 219K".to_string())
     );
 }
 
@@ -9534,7 +9534,7 @@ async fn status_line_moves_current_dir_to_second_line() {
 
     assert_eq!(
         status_line_text(&chat),
-        Some("gpt-5.4 xhigh · Full [████████] 258K · Compact [████████] 231K\n/repo".to_string())
+        Some("gpt-5.4 xhigh · Full [████████] 245K · Compact [████████] 219K\n/repo".to_string())
     );
 }
 

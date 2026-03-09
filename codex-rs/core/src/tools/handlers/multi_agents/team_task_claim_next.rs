@@ -26,6 +26,7 @@ pub async fn handle(
     let config =
         super::read_persisted_team_config(turn.config.codex_home.as_path(), &team_id).await?;
     super::assert_team_member_or_lead(&team_id, &config, session.conversation_id)?;
+    super::assert_team_state_allows_collaboration(&team_id, config.state, "team_task_claim_next")?;
     let caller_thread_id = session.conversation_id.to_string();
     let is_lead = caller_thread_id == config.lead_thread_id;
     let valid_member_agent_ids = config

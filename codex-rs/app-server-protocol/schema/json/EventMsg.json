@@ -3199,6 +3199,14 @@
               "description": "ID of the waiting call.",
               "type": "string"
             },
+            "failure_reason": {
+              "default": null,
+              "description": "Failure reason when the wait operation ended in a blocked or failed state.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "sender_thread_id": {
               "allOf": [
                 {
@@ -6028,7 +6036,21 @@
         "last_token_usage": {
           "$ref": "#/definitions/TokenUsage"
         },
+        "model_auto_compact_token_limit": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "model_context_window": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model_full_context_window": {
           "format": "int64",
           "type": [
             "integer",
@@ -9032,6 +9054,14 @@
         "call_id": {
           "description": "ID of the waiting call.",
           "type": "string"
+        },
+        "failure_reason": {
+          "default": null,
+          "description": "Failure reason when the wait operation ended in a blocked or failed state.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "sender_thread_id": {
           "allOf": [

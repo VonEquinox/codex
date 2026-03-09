@@ -1133,7 +1133,10 @@ fn create_spawn_team_tool(config: &ToolsConfig) -> ToolSpec {
         (
             "task".to_string(),
             JsonSchema::String {
-                description: Some("Initial task for this member.".to_string()),
+                description: Some(
+                    "Initial task for this member. Make it concrete and scoped to one owned slice."
+                        .to_string(),
+                ),
             },
         ),
         (
@@ -1160,7 +1163,7 @@ fn create_spawn_team_tool(config: &ToolsConfig) -> ToolSpec {
             "worktree".to_string(),
             JsonSchema::Boolean {
                 description: Some(
-                    "Reserved for future use. The current build rejects worktree=true."
+                    "When true, spawn this member in a dedicated git worktree rooted under the lead session."
                         .to_string(),
                 ),
             },
@@ -1193,7 +1196,8 @@ fn create_spawn_team_tool(config: &ToolsConfig) -> ToolSpec {
                     additional_properties: Some(false.into()),
                 }),
                 description: Some(
-                    "Team members to spawn. Each member receives its own task.".to_string(),
+                    "Team members to spawn. Give each member a clear ownership boundary and initial task."
+                        .to_string(),
                 ),
             },
         ),
@@ -1201,7 +1205,7 @@ fn create_spawn_team_tool(config: &ToolsConfig) -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_team".to_string(),
-        description: "Spawn a group of sub-agents for parallel task execution and register them under a team id. Limitations: teammates cannot spawn nested teams.".to_string(),
+        description: "Create a lead-managed team of named sub-agents for parallel work. Give each member a clear owned slice and task, then coordinate with the team task, message, and inbox tools. Limitations: teammates cannot spawn nested teams.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1240,9 +1244,7 @@ fn create_wait_team_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_team".to_string(),
-        description:
-            "Wait for team members to reach final states, with support for all/any completion semantics."
-                .to_string(),
+        description: "Wait for team members to reach final states. Use `mode: any` when the lead wants the first finished report, or `mode: all` when closing out the whole team.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1273,8 +1275,7 @@ fn create_close_team_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "close_team".to_string(),
-        description: "Close one or more team members and remove them from the team registry."
-            .to_string(),
+        description: "Shut down one or more team members and update persisted team state. Close all members before `team_cleanup`.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1294,7 +1295,7 @@ fn create_team_task_list_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "team_task_list".to_string(),
-        description: "List persisted tasks for a team.".to_string(),
+        description: "Read the shared persisted task list for this team. Leads use it to track progress; teammates use it before claiming work.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1322,7 +1323,7 @@ fn create_team_task_claim_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "team_task_claim".to_string(),
-        description: "Claim a specific team task when dependencies are satisfied.".to_string(),
+        description: "Claim a specific team task after its dependencies are satisfied.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1352,9 +1353,7 @@ fn create_team_task_claim_next_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "team_task_claim_next".to_string(),
-        description:
-            "Claim the next pending claimable task, optionally scoped to a specific team member."
-                .to_string(),
+        description: "Claim the next pending task whose dependencies are satisfied, optionally restricted to one assignee.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1382,7 +1381,8 @@ fn create_team_task_complete_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "team_task_complete".to_string(),
-        description: "Mark a team task as completed.".to_string(),
+        description: "Mark a claimed team task as completed so dependent work can proceed."
+            .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1429,7 +1429,7 @@ fn create_team_message_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "team_message".to_string(),
-        description: "Send a message to one member in a team.".to_string(),
+        description: "Send a direct coordination message to one teammate. Prefer this for handoffs, clarifications, or focused follow-up requests.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1469,7 +1469,7 @@ fn create_team_broadcast_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "team_broadcast".to_string(),
-        description: "Broadcast one message to every member in a team.".to_string(),
+        description: "Send the same message to every teammate. Use this for global replans or shared status requests, not targeted handoffs.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1509,7 +1509,9 @@ fn create_team_ask_lead_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "team_ask_lead".to_string(),
-        description: "Send a message to the team lead.".to_string(),
+        description:
+            "Escalate a blocker, scope question, or decision request from a teammate to the lead."
+                .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1537,7 +1539,7 @@ fn create_team_inbox_pop_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "team_inbox_pop".to_string(),
-        description: "Pop messages from the caller's durable team inbox.".to_string(),
+        description: "Read queued durable team messages for the caller. Use this to catch missed handoffs or deferred coordination.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1568,7 +1570,8 @@ fn create_team_inbox_ack_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "team_inbox_ack".to_string(),
-        description: "Acknowledge previously popped inbox messages.".to_string(),
+        description: "Acknowledge durable inbox messages after you have processed them."
+            .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1588,7 +1591,7 @@ fn create_team_cleanup_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "team_cleanup".to_string(),
-        description: "Remove shared team resources (team config, tasks, inbox). Must be run by the lead and fails if any teammates are still running; shut them down first with close_team.".to_string(),
+        description: "Remove shared team resources after the team is fully closed. Must be run by the lead after `close_team` has moved the team into `cleanup_pending`.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,

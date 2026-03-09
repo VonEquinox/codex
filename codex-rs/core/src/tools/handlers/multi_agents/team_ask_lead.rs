@@ -31,6 +31,7 @@ pub async fn handle(
 
     let config =
         super::read_persisted_team_config(turn.config.codex_home.as_path(), &team_id).await?;
+    super::assert_team_state_allows_collaboration(&team_id, config.state, "team_ask_lead")?;
     let sender_thread_id = session.conversation_id.to_string();
     if sender_thread_id == config.lead_thread_id {
         return Err(FunctionCallError::RespondToModel(
@@ -76,7 +77,22 @@ pub async fn handle(
     .await;
 
     let (delivered, submission_id, error) = match delivery {
-        Ok(submission_id) => (true, submission_id, None),
+        Ok(submission_id) => {
+            if let Err(err) = inbox::mark_inbox_entry_live_delivered(
+                turn.config.codex_home.as_path(),
+                &team_id,
+                lead_thread_id,
+                &inbox_entry_id,
+            )
+            .await
+            {
+                warn!(
+                    "failed to mark inbox entry {inbox_entry_id} as live-delivered for team \
+                     {team_id}: {err}"
+                );
+            }
+            (true, submission_id, None)
+        }
         Err(err) => (false, String::new(), Some(err.to_string())),
     };
 

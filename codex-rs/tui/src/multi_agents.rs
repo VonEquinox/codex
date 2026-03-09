@@ -236,13 +236,21 @@ pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
         sender_thread_id: _,
         agent_statuses,
         statuses,
+        failure_reason,
     } = ev;
-    let details = wait_complete_lines(&statuses, &agent_statuses);
-    let title = match team_call_kind(&call_id) {
-        Some(TeamCallKind::Spawn) => title_text("Created agent team"),
-        Some(TeamCallKind::Wait) => title_text("Finished waiting for agent team"),
-        Some(TeamCallKind::Close) => title_text("Closed agent team"),
-        None => title_text("Finished waiting"),
+    let mut details = wait_complete_lines(&statuses, &agent_statuses);
+    if let Some(reason) = failure_reason.as_deref() {
+        details.push(failure_reason_line(reason));
+    }
+    let title = match (team_call_kind(&call_id), failure_reason.is_some()) {
+        (Some(TeamCallKind::Spawn), false) => title_text("Created agent team"),
+        (Some(TeamCallKind::Spawn), true) => title_text("Agent team creation failed"),
+        (Some(TeamCallKind::Wait), false) => title_text("Finished waiting for agent team"),
+        (Some(TeamCallKind::Wait), true) => title_text("Agent team wait failed"),
+        (Some(TeamCallKind::Close), false) => title_text("Closed agent team"),
+        (Some(TeamCallKind::Close), true) => title_text("Agent team close failed"),
+        (None, false) => title_text("Finished waiting"),
+        (None, true) => title_text("Wait failed"),
     };
     collab_event(title, details)
 }
@@ -504,6 +512,14 @@ fn status_summary_line(status: &AgentStatus) -> Line<'static> {
     status_summary_spans(status).into()
 }
 
+fn failure_reason_line(reason: &str) -> Line<'static> {
+    vec![
+        "Failure: ".red(),
+        truncate_text(reason, COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES).into(),
+    ]
+    .into()
+}
+
 fn status_summary_spans(status: &AgentStatus) -> Vec<Span<'static>> {
     match status {
         AgentStatus::PendingInit => vec![Span::from("Pending init").cyan()],
@@ -612,6 +628,7 @@ mod tests {
                 },
             ],
             statuses,
+            failure_reason: None,
         });
 
         let close = close_end(CollabCloseEndEvent {
@@ -676,9 +693,37 @@ mod tests {
                 status: AgentStatus::Completed(None),
             }],
             statuses,
+            failure_reason: None,
         });
 
         assert_snapshot!("collab_team_spawn_end", cell_to_text(&cell));
+    }
+
+    #[test]
+    fn team_wait_failure_uses_failed_title() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let planner_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid planner thread id");
+        let mut statuses = HashMap::new();
+        statuses.insert(planner_id, AgentStatus::Completed(None));
+
+        let cell = waiting_end(CollabWaitingEndEvent {
+            call_id: "team/wait:call-team".to_string(),
+            sender_thread_id,
+            agent_statuses: vec![CollabAgentStatusEntry {
+                thread_id: planner_id,
+                agent_nickname: Some("planner".to_string()),
+                agent_role: Some("develop".to_string()),
+                status: AgentStatus::Completed(None),
+            }],
+            statuses,
+            failure_reason: Some(
+                "teammate_idle hook 'idle-guard' blocked: blocked teammate".into(),
+            ),
+        });
+
+        assert_snapshot!("collab_team_wait_failed", cell_to_text(&cell));
     }
 
     #[test]

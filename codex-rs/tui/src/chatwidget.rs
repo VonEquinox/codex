@@ -1802,8 +1802,8 @@ impl ChatWidget {
 
     fn context_window_total_tokens(&self, info: &TokenUsageInfo) -> Option<i64> {
         info.model_full_context_window
-            .or(self.config.model_context_window)
             .or(info.model_context_window)
+            .or(self.config.model_context_window)
     }
 
     fn context_window_auto_compact_limit(

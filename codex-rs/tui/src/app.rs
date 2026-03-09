@@ -1439,13 +1439,50 @@ impl App {
     fn mark_agent_picker_thread_closed(&mut self, thread_id: ThreadId) {
         if let Some(entry) = self.agent_picker_threads.get_mut(&thread_id) {
             entry.is_closed = true;
-            entry.badge = AgentPickerBadge::None;
         } else {
             self.upsert_agent_picker_thread(thread_id, None, None, true, AgentPickerBadge::None);
         }
     }
 
+    fn update_agent_picker_threads_from_wait_end(
+        &mut self,
+        ev: &codex_protocol::protocol::CollabWaitingEndEvent,
+    ) {
+        let mut seen = HashSet::new();
+        for agent in &ev.agent_statuses {
+            seen.insert(agent.thread_id);
+            let entry = self
+                .agent_picker_threads
+                .entry(agent.thread_id)
+                .or_default();
+            if agent.agent_nickname.is_some() {
+                entry.agent_nickname = agent.agent_nickname.clone();
+            }
+            if agent.agent_role.is_some() {
+                entry.agent_role = agent.agent_role.clone();
+            }
+            entry.badge = agent_picker_badge_from_status(&agent.status);
+            if matches!(entry.badge, AgentPickerBadge::Working) {
+                entry.is_closed = false;
+            }
+        }
+
+        for (thread_id, status) in &ev.statuses {
+            if seen.contains(thread_id) {
+                continue;
+            }
+            let entry = self.agent_picker_threads.entry(*thread_id).or_default();
+            entry.badge = agent_picker_badge_from_status(status);
+            if matches!(entry.badge, AgentPickerBadge::Working) {
+                entry.is_closed = false;
+            }
+        }
+    }
+
     fn update_agent_picker_thread_badge_from_event(&mut self, thread_id: ThreadId, msg: &EventMsg) {
+        if let EventMsg::CollabWaitingEnd(ev) = msg {
+            self.update_agent_picker_threads_from_wait_end(ev);
+        }
         let badge = match msg {
             EventMsg::TurnStarted(_) => Some(AgentPickerBadge::Working),
             EventMsg::TurnComplete(_) => Some(AgentPickerBadge::Finish),
@@ -5188,14 +5225,14 @@ mod tests {
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
                 is_closed: true,
-                badge: AgentPickerBadge::None,
+                badge: AgentPickerBadge::Finish,
             })
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn mark_agent_picker_thread_closed_clears_stale_badge() -> Result<()> {
+    async fn mark_agent_picker_thread_closed_preserves_terminal_badge() -> Result<()> {
         let mut app = make_test_app().await;
         let thread_id = ThreadId::new();
         app.agent_picker_threads.insert(
@@ -5216,7 +5253,7 @@ mod tests {
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
                 is_closed: true,
-                badge: AgentPickerBadge::None,
+                badge: AgentPickerBadge::Error,
             })
         );
         Ok(())
@@ -5279,6 +5316,65 @@ mod tests {
                 .get(&thread_id)
                 .map(|entry| entry.badge),
             Some(AgentPickerBadge::Finish)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_updates_agent_picker_badges_from_wait_end() -> Result<()> {
+        let mut app = make_test_app().await;
+        let leader_thread_id = ThreadId::new();
+        let worker_thread_id = ThreadId::new();
+        app.thread_event_channels
+            .insert(leader_thread_id, ThreadEventChannel::new(1));
+        app.agent_picker_threads.insert(
+            worker_thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                is_closed: true,
+                badge: AgentPickerBadge::Working,
+            },
+        );
+
+        app.enqueue_thread_event(
+            leader_thread_id,
+            Event {
+                id: "wait-end".to_string(),
+                msg: EventMsg::CollabWaitingEnd(codex_protocol::protocol::CollabWaitingEndEvent {
+                    sender_thread_id: leader_thread_id,
+                    call_id: "team/wait:call-1".to_string(),
+                    agent_statuses: vec![codex_protocol::protocol::CollabAgentStatusEntry {
+                        thread_id: worker_thread_id,
+                        agent_nickname: Some("Robie".to_string()),
+                        agent_role: Some("explorer".to_string()),
+                        status: codex_protocol::protocol::AgentStatus::Completed(Some(
+                            "done".to_string(),
+                        )),
+                    }],
+                    statuses: [(
+                        worker_thread_id,
+                        codex_protocol::protocol::AgentStatus::Completed(Some("done".to_string())),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    failure_reason: None,
+                }),
+            },
+        )
+        .await?;
+        assert_eq!(
+            app.agent_picker_threads
+                .get(&worker_thread_id)
+                .map(|entry| entry.badge),
+            Some(AgentPickerBadge::Finish)
+        );
+        assert_eq!(
+            app.agent_picker_threads
+                .get(&worker_thread_id)
+                .map(|entry| entry.is_closed),
+            Some(true)
         );
 
         Ok(())

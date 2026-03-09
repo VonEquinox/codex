@@ -86,8 +86,14 @@ struct CloseAgentArgs {
 #[derive(Debug, Clone)]
 struct TeamMember {
     name: String,
+    member_id: String,
     agent_id: ThreadId,
     agent_type: Option<String>,
+    model_provider: Option<String>,
+    model: Option<String>,
+    initial_task: String,
+    background: bool,
+    worktree: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +144,8 @@ struct PersistedTeamConfig {
     team_name: String,
     lead_thread_id: String,
     created_at: i64,
+    #[serde(default = "default_persisted_team_state")]
+    state: PersistedTeamState,
     members: Vec<PersistedTeamMember>,
 }
 
@@ -145,8 +153,26 @@ struct PersistedTeamConfig {
 #[serde(rename_all = "camelCase")]
 struct PersistedTeamMember {
     name: String,
+    #[serde(default)]
+    member_id: Option<String>,
     agent_id: String,
     agent_type: Option<String>,
+    model_provider: Option<String>,
+    model: Option<String>,
+    initial_task: String,
+    #[serde(default)]
+    background: bool,
+    #[serde(default)]
+    worktree: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PersistedTeamState {
+    Active,
+    Closing,
+    CleanupPending,
+    Cleaning,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -182,12 +208,20 @@ fn now_unix_seconds() -> i64 {
         .map_or(0, |duration| duration.as_secs() as i64)
 }
 
+fn default_persisted_team_state() -> PersistedTeamState {
+    PersistedTeamState::Active
+}
+
 fn team_dir(codex_home: &Path, team_id: &str) -> std::path::PathBuf {
     codex_home.join(TEAM_CONFIG_DIR).join(team_id)
 }
 
 fn team_config_path(codex_home: &Path, team_id: &str) -> std::path::PathBuf {
     team_dir(codex_home, team_id).join("config.json")
+}
+
+fn team_lock_path(codex_home: &Path, team_id: &str) -> PathBuf {
+    team_dir(codex_home, team_id).join("team.lock")
 }
 
 fn worktree_root_dir(codex_home: &Path, lead_thread_id: ThreadId) -> PathBuf {
@@ -202,6 +236,19 @@ fn worktree_leases_dir(codex_home: &Path) -> PathBuf {
 
 fn worktree_lease_path(codex_home: &Path, agent_id: ThreadId) -> PathBuf {
     worktree_leases_dir(codex_home).join(format!("{agent_id}.json"))
+}
+
+async fn lock_team(
+    codex_home: &Path,
+    team_id: &str,
+) -> Result<locks::FileLockGuard, FunctionCallError> {
+    let team_dir = team_dir(codex_home, team_id);
+    tokio::fs::create_dir_all(&team_dir)
+        .await
+        .map_err(|err| team_persistence_error("create team directory", team_id, err))?;
+    locks::lock_file_exclusive(&team_lock_path(codex_home, team_id))
+        .await
+        .map_err(|err| team_persistence_error("lock team state", team_id, err))
 }
 
 async fn read_persisted_team_config(
@@ -241,6 +288,83 @@ fn assert_team_member_or_lead(
     Err(FunctionCallError::RespondToModel(format!(
         "thread `{caller_thread_id}` is not a member of team `{team_id}`"
     )))
+}
+
+fn assert_team_lead(
+    team_id: &str,
+    config: &PersistedTeamConfig,
+    caller_thread_id: ThreadId,
+) -> Result<(), FunctionCallError> {
+    if caller_thread_id.to_string() == config.lead_thread_id {
+        return Ok(());
+    }
+
+    Err(FunctionCallError::RespondToModel(format!(
+        "team `{team_id}` can only be managed by the lead thread `{}`",
+        config.lead_thread_id
+    )))
+}
+
+impl PersistedTeamState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Closing => "closing",
+            Self::CleanupPending => "cleanup_pending",
+            Self::Cleaning => "cleaning",
+        }
+    }
+}
+
+fn assert_team_state(
+    team_id: &str,
+    state: PersistedTeamState,
+    action: &str,
+    allowed: &[PersistedTeamState],
+) -> Result<(), FunctionCallError> {
+    if allowed.contains(&state) {
+        return Ok(());
+    }
+
+    Err(FunctionCallError::RespondToModel(format!(
+        "team `{team_id}` is `{}` and does not allow {action}",
+        state.as_str()
+    )))
+}
+
+fn assert_team_state_allows_collaboration(
+    team_id: &str,
+    state: PersistedTeamState,
+    action: &str,
+) -> Result<(), FunctionCallError> {
+    assert_team_state(team_id, state, action, &[PersistedTeamState::Active])
+}
+
+fn assert_team_state_allows_close(
+    team_id: &str,
+    state: PersistedTeamState,
+) -> Result<(), FunctionCallError> {
+    assert_team_state(
+        team_id,
+        state,
+        "close_team",
+        &[PersistedTeamState::Active, PersistedTeamState::Closing],
+    )
+}
+
+fn assert_team_state_allows_cleanup(
+    team_id: &str,
+    state: PersistedTeamState,
+) -> Result<(), FunctionCallError> {
+    assert_team_state(
+        team_id,
+        state,
+        "team_cleanup",
+        &[
+            PersistedTeamState::CleanupPending,
+            PersistedTeamState::Cleaning,
+        ],
+    )
 }
 
 fn team_tasks_dir(codex_home: &Path, team_id: &str) -> std::path::PathBuf {
@@ -306,19 +430,27 @@ async fn write_json_atomic<T: Serialize>(path: &Path, payload: &T) -> Result<(),
 fn persisted_team_config(
     sender_thread_id: ThreadId,
     team_id: &str,
+    state: PersistedTeamState,
     team: &TeamRecord,
 ) -> PersistedTeamConfig {
     PersistedTeamConfig {
         team_name: team_id.to_string(),
         lead_thread_id: sender_thread_id.to_string(),
         created_at: team.created_at,
+        state,
         members: team
             .members
             .iter()
             .map(|member| PersistedTeamMember {
                 name: member.name.clone(),
+                member_id: Some(member.member_id.clone()),
                 agent_id: member.agent_id.to_string(),
                 agent_type: member.agent_type.clone(),
+                model_provider: member.model_provider.clone(),
+                model: member.model.clone(),
+                initial_task: member.initial_task.clone(),
+                background: member.background,
+                worktree: member.worktree,
             })
             .collect(),
     }
@@ -345,8 +477,14 @@ fn team_record_from_persisted_config(
             let agent_id = agent_id(&member.agent_id)?;
             Ok(TeamMember {
                 name: member.name,
+                member_id: member.member_id.unwrap_or_else(|| agent_id.to_string()),
                 agent_id,
                 agent_type: member.agent_type,
+                model_provider: member.model_provider,
+                model: member.model,
+                initial_task: member.initial_task,
+                background: member.background,
+                worktree: member.worktree,
             })
         })
         .collect::<Result<Vec<_>, FunctionCallError>>()
@@ -442,10 +580,11 @@ async fn persist_team_state(
     codex_home: &Path,
     sender_thread_id: ThreadId,
     team_id: &str,
+    state: PersistedTeamState,
     team: &TeamRecord,
     initial_tasks: Option<&[PersistedTeamTask]>,
 ) -> Result<(), FunctionCallError> {
-    let config = persisted_team_config(sender_thread_id, team_id, team);
+    let config = persisted_team_config(sender_thread_id, team_id, state, team);
     let config_path = team_config_path(codex_home, team_id);
     write_json_atomic(&config_path, &config)
         .await
@@ -997,21 +1136,20 @@ fn prefixed_team_call_id(prefix: &str, call_id: &str) -> String {
     format!("{prefix}{call_id}")
 }
 
+fn team_member_role_name(agent_type: Option<&str>) -> &str {
+    agent_type
+        .map(str::trim)
+        .filter(|agent_type| !agent_type.is_empty())
+        .unwrap_or("default")
+}
+
 fn team_member_refs(members: &[TeamMember]) -> Vec<CollabAgentRef> {
     members
         .iter()
         .map(|member| CollabAgentRef {
             thread_id: member.agent_id,
             agent_nickname: Some(member.name.clone()),
-            agent_role: Some(
-                member
-                    .agent_type
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|agent_type| !agent_type.is_empty())
-                    .unwrap_or("default")
-                    .to_string(),
-            ),
+            agent_role: Some(team_member_role_name(member.agent_type.as_deref()).to_string()),
         })
         .collect()
 }
@@ -1025,15 +1163,7 @@ fn team_member_status_entries(
         .map(|member| CollabAgentStatusEntry {
             thread_id: member.agent_id,
             agent_nickname: Some(member.name.clone()),
-            agent_role: Some(
-                member
-                    .agent_type
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|agent_type| !agent_type.is_empty())
-                    .unwrap_or("default")
-                    .to_string(),
-            ),
+            agent_role: Some(team_member_role_name(member.agent_type.as_deref()).to_string()),
             status: statuses
                 .get(&member.agent_id)
                 .cloned()
@@ -1042,31 +1172,137 @@ fn team_member_status_entries(
         .collect()
 }
 
+fn build_team_bootstrap_message(
+    team_id: &str,
+    lead_thread_id: ThreadId,
+    member_name: &str,
+    role_name: &str,
+    background: bool,
+    worktree: bool,
+    roster_lines: &[String],
+    task_summary: Option<&str>,
+    resumed: bool,
+) -> String {
+    let task_line = task_summary
+        .map(str::trim)
+        .filter(|task| !task.is_empty())
+        .map(|task| format!("Planned responsibility: `{task}`.\n"))
+        .unwrap_or_default();
+    let background_line = if background {
+        "You are a background teammate. Prioritize analysis, reporting, and concise handoffs."
+    } else {
+        "You are an active teammate. Own your assigned slice until it is complete or blocked."
+    };
+    let worktree_line = if worktree {
+        "You are running in a dedicated git worktree rooted at your current cwd."
+    } else {
+        "You are sharing the lead's cwd unless the lead narrows your scope."
+    };
+    let delivery_line = if resumed {
+        "You were resumed from rollout. Re-check `team_inbox_pop` and outstanding team tasks before continuing."
+    } else {
+        "Your initial task follows as the next user message."
+    };
+    let roster = roster_lines.join("\n");
+
+    format!(
+        "<agent_team_context>\n\
+You are `{member_name}` in agent team `{team_id}`.\n\
+Role: `{role_name}`\n\
+Lead thread: `{lead_thread_id}`\n\
+\n\
+Team roster:\n\
+{roster}\n\
+\n\
+Team operating rules:\n\
+- You are not the lead. Escalate scope changes, priority changes, or blockers with `team_ask_lead`.\n\
+- Own your assigned slice and avoid overlapping another teammate's work without coordination.\n\
+- Claim queued work with `team_task_claim_next` or `team_task_claim` before starting unclaimed tasks, then call `team_task_complete` when your slice is done.\n\
+- Use `team_message` for direct teammate coordination and handoffs.\n\
+- Check `team_inbox_pop` for queued messages and `team_inbox_ack` after processing them.\n\
+- Keep updates concise and decision-oriented: progress, artifacts, blockers, and next step.\n\
+- Do not spawn nested teams or unrelated agents unless the lead explicitly asks.\n\
+\n\
+{background_line}\n\
+{worktree_line}\n\
+{task_line}\
+{delivery_line}\n\
+</agent_team_context>"
+    )
+}
+
+fn build_spawn_team_bootstrap_message(
+    team_id: &str,
+    lead_thread_id: ThreadId,
+    member_name: &str,
+    agent_type: Option<&str>,
+    background: bool,
+    worktree: bool,
+    task_summary: &str,
+    requested_members: &[spawn_team::SpawnTeamMemberArgs],
+) -> String {
+    let roster_lines = requested_members
+        .iter()
+        .map(|member| {
+            let role_name = team_member_role_name(member.agent_type.as_deref());
+            let task = member.task.trim();
+            format!("- `{}` [{role_name}]: {task}", member.name.trim())
+        })
+        .collect::<Vec<_>>();
+
+    build_team_bootstrap_message(
+        team_id,
+        lead_thread_id,
+        member_name,
+        team_member_role_name(agent_type),
+        background,
+        worktree,
+        &roster_lines,
+        Some(task_summary),
+        false,
+    )
+}
+
+fn build_resume_team_bootstrap_message(
+    team_id: &str,
+    config: &PersistedTeamConfig,
+    member: &PersistedTeamMember,
+) -> String {
+    let roster_lines = config
+        .members
+        .iter()
+        .map(|teammate| {
+            let role_name = team_member_role_name(teammate.agent_type.as_deref());
+            let initial_task = teammate.initial_task.trim();
+            if initial_task.is_empty() {
+                format!("- `{}` [{role_name}]", teammate.name)
+            } else {
+                format!("- `{}` [{role_name}]: {initial_task}", teammate.name)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    build_team_bootstrap_message(
+        team_id,
+        agent_id(&config.lead_thread_id).unwrap_or(ThreadId::new()),
+        &member.name,
+        team_member_role_name(member.agent_type.as_deref()),
+        member.background,
+        member.worktree,
+        &roster_lines,
+        Some(member.initial_task.as_str()),
+        true,
+    )
+}
+
 async fn get_team_record(
     codex_home: &Path,
     sender_thread_id: ThreadId,
     team_id: &str,
 ) -> Result<TeamRecord, FunctionCallError> {
-    {
-        let registry = team_registry()
-            .lock()
-            .map_err(|_| FunctionCallError::Fatal("team registry poisoned".to_string()))?;
-        if let Some(team) = registry
-            .get(&sender_thread_id)
-            .and_then(|teams| teams.get(team_id))
-            .cloned()
-        {
-            return Ok(team);
-        }
-    }
-
     let config = read_persisted_team_config(codex_home, team_id).await?;
+    assert_team_member_or_lead(team_id, &config, sender_thread_id)?;
     let (lead_thread_id, team_record) = team_record_from_persisted_config(team_id, config)?;
-    if lead_thread_id != sender_thread_id {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "team `{team_id}` not found"
-        )));
-    }
 
     let mut registry = team_registry()
         .lock()
@@ -1146,6 +1382,57 @@ async fn find_team_for_member(
                 .or_default()
                 .insert(team_id.clone(), team_record);
             return Ok(Some(team_id));
+        }
+    }
+
+    Ok(None)
+}
+
+async fn find_persisted_team_member(
+    codex_home: &Path,
+    member_thread_id: ThreadId,
+) -> Result<Option<(String, PersistedTeamConfig, PersistedTeamMember)>, FunctionCallError> {
+    let teams_root = codex_home.join(TEAM_CONFIG_DIR);
+    let mut dir = match tokio::fs::read_dir(&teams_root).await {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "failed to read persisted teams in `{}`: {err}",
+                teams_root.display()
+            )));
+        }
+    };
+
+    while let Some(entry) = dir.next_entry().await.map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "failed to iterate persisted teams in `{}`: {err}",
+            teams_root.display()
+        ))
+    })? {
+        let file_type = entry.file_type().await.map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to inspect persisted team entry `{}`: {err}",
+                entry.path().display()
+            ))
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let team_id = entry.file_name().to_string_lossy().into_owned();
+        let config = match read_persisted_team_config(codex_home, &team_id).await {
+            Ok(config) => config,
+            Err(FunctionCallError::RespondToModel(_)) => continue,
+            Err(err) => return Err(err),
+        };
+        if let Some(member) = config
+            .members
+            .iter()
+            .find(|member| member.agent_id == member_thread_id.to_string())
+            .cloned()
+        {
+            return Ok(Some((team_id, config, member)));
         }
     }
 

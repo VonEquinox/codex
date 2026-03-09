@@ -36,6 +36,14 @@ struct SpawnTeamResult {
     members: Vec<SpawnTeamMemberResult>,
 }
 
+struct PendingSpawnDispatch {
+    agent_id: ThreadId,
+    notification_source: Option<SessionSource>,
+    input_items: Vec<UserInput>,
+    injected_context: String,
+    background: bool,
+}
+
 pub async fn handle(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -83,6 +91,16 @@ pub async fn handle(
         Some(team_id) => normalized_team_id(&team_id)?,
         None => ThreadId::new().to_string(),
     };
+    let team_dir_path = team_dir(turn.config.codex_home.as_path(), &team_id);
+    let team_lock = lock_team(turn.config.codex_home.as_path(), &team_id).await?;
+    if tokio::fs::try_exists(team_config_path(turn.config.codex_home.as_path(), &team_id))
+        .await
+        .map_err(|err| team_persistence_error("check team config", &team_id, err))?
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "team `{team_id}` already exists"
+        )));
+    }
 
     let child_depth = next_thread_spawn_depth(&turn.session_source);
     if exceeds_thread_spawn_depth_limit(child_depth, turn.config.agent_max_depth) {
@@ -108,6 +126,7 @@ pub async fn handle(
 
     let mut statuses = HashMap::new();
     let mut spawned_members = Vec::new();
+    let mut pending_dispatches = Vec::new();
 
     for member in &requested_members {
         let member_name = member.name.trim().to_string();
@@ -145,10 +164,13 @@ pub async fn handle(
                             call_id: event_call_id,
                             agent_statuses,
                             statuses,
+                            failure_reason: None,
                         }
                         .into(),
                     )
                     .await;
+                drop(team_lock);
+                let _ = remove_dir_if_exists(&team_dir_path).await;
                 return Err(err);
             }
         };
@@ -169,10 +191,13 @@ pub async fn handle(
                                 call_id: event_call_id,
                                 agent_statuses,
                                 statuses,
+                                failure_reason: None,
                             }
                             .into(),
                         )
                         .await;
+                    drop(team_lock);
+                    let _ = remove_dir_if_exists(&team_dir_path).await;
                     return Err(err);
                 }
             }
@@ -235,10 +260,13 @@ pub async fn handle(
                             call_id: event_call_id,
                             agent_statuses,
                             statuses,
+                            failure_reason: None,
                         }
                         .into(),
                     )
                     .await;
+                drop(team_lock);
+                let _ = remove_dir_if_exists(&team_dir_path).await;
                 return Err(err);
             }
         };
@@ -250,62 +278,68 @@ pub async fn handle(
             role_name.unwrap_or("default"),
         )
         .await;
-        if !hook_context.is_empty() {
-            let injected = hook_context.join("\n\n");
-            if let Err(err) = session
-                .services
-                .agent_control
-                .inject_developer_message_without_turn(agent_id, injected)
-                .await
-            {
-                warn!("failed to inject subagent_start hook context: {err}");
-            }
-        }
-
-        if let Err(err) = session
-            .services
-            .agent_control
-            .send_spawn_input(agent_id, input_items, notification_source)
-            .await
-        {
-            if let Some(lease) = worktree_lease {
-                let _ = remove_worktree_lease(&session, &turn, lease).await;
-            }
-            let _ = session
-                .services
-                .agent_control
-                .shutdown_agent(agent_id)
-                .await;
-            cleanup_spawned_team_members(&session, &turn, &spawned_members).await;
-            let agent_statuses = team_member_status_entries(&spawned_members, &statuses);
-            session
-                .send_event(
-                    &turn,
-                    CollabWaitingEndEvent {
-                        sender_thread_id: session.conversation_id,
-                        call_id: event_call_id,
-                        agent_statuses,
-                        statuses,
-                    }
-                    .into(),
-                )
-                .await;
-            return Err(collab_spawn_error(err));
-        }
-
+        let team_bootstrap = build_spawn_team_bootstrap_message(
+            &team_id,
+            session.conversation_id,
+            &member_name,
+            member.agent_type.as_deref(),
+            background,
+            use_worktree,
+            member.task.trim(),
+            &requested_members,
+        );
+        let mut injected_context = vec![team_bootstrap];
+        injected_context.extend(hook_context);
+        let injected = injected_context.join("\n\n");
         if let Some(lease) = worktree_lease {
-            register_worktree_lease(turn.config.codex_home.as_path(), agent_id, lease).await?;
-        }
-        if background {
-            maybe_start_background_agent_cleanup(session.clone(), turn.clone(), agent_id);
+            if let Err(err) =
+                register_worktree_lease(turn.config.codex_home.as_path(), agent_id, lease).await
+            {
+                let _ = session
+                    .services
+                    .agent_control
+                    .shutdown_agent(agent_id)
+                    .await;
+                cleanup_spawned_team_members(&session, &turn, &spawned_members).await;
+                let agent_statuses = team_member_status_entries(&spawned_members, &statuses);
+                session
+                    .send_event(
+                        &turn,
+                        CollabWaitingEndEvent {
+                            sender_thread_id: session.conversation_id,
+                            call_id: event_call_id,
+                            agent_statuses,
+                            statuses,
+                            failure_reason: None,
+                        }
+                        .into(),
+                    )
+                    .await;
+                drop(team_lock);
+                let _ = remove_dir_if_exists(&team_dir_path).await;
+                return Err(err);
+            }
         }
 
         let status = session.services.agent_control.get_status(agent_id).await;
         statuses.insert(agent_id, status);
         spawned_members.push(TeamMember {
             name: member_name,
+            member_id: ThreadId::new().to_string(),
             agent_id,
             agent_type: member.agent_type.clone(),
+            model_provider: member.model_provider.clone(),
+            model: member.model.clone(),
+            initial_task: member.task.trim().to_string(),
+            background,
+            worktree: use_worktree,
+        });
+        pending_dispatches.push(PendingSpawnDispatch {
+            agent_id,
+            notification_source,
+            input_items,
+            injected_context: injected,
+            background,
         });
     }
     let team_record = TeamRecord {
@@ -328,10 +362,13 @@ pub async fn handle(
                     call_id: event_call_id,
                     agent_statuses,
                     statuses,
+                    failure_reason: None,
                 }
                 .into(),
             )
             .await;
+        drop(team_lock);
+        let _ = remove_dir_if_exists(&team_dir_path).await;
         return Err(err);
     }
     let initial_tasks = build_initial_team_tasks(&requested_members, &spawned_members, created_at);
@@ -339,6 +376,7 @@ pub async fn handle(
         turn.config.codex_home.as_path(),
         session.conversation_id,
         &team_id,
+        PersistedTeamState::Active,
         &team_record,
         Some(&initial_tasks),
     )
@@ -356,12 +394,64 @@ pub async fn handle(
                     call_id: event_call_id,
                     agent_statuses,
                     statuses,
+                    failure_reason: None,
                 }
                 .into(),
             )
             .await;
+        drop(team_lock);
+        let _ = remove_dir_if_exists(&team_dir_path).await;
         return Err(err);
     }
+
+    for dispatch in pending_dispatches {
+        if !dispatch.injected_context.is_empty()
+            && let Err(err) = session
+                .services
+                .agent_control
+                .inject_developer_message_without_turn(dispatch.agent_id, dispatch.injected_context)
+                .await
+        {
+            warn!("failed to inject spawn_team teammate context: {err}");
+        }
+
+        if let Err(err) = session
+            .services
+            .agent_control
+            .send_spawn_input(
+                dispatch.agent_id,
+                dispatch.input_items,
+                dispatch.notification_source,
+            )
+            .await
+        {
+            let _ = remove_team_record(session.conversation_id, &team_id);
+            let _ = remove_team_persistence(turn.config.codex_home.as_path(), &team_id).await;
+            cleanup_spawned_team_members(&session, &turn, &spawned_members).await;
+            let agent_statuses = team_member_status_entries(&spawned_members, &statuses);
+            session
+                .send_event(
+                    &turn,
+                    CollabWaitingEndEvent {
+                        sender_thread_id: session.conversation_id,
+                        call_id: event_call_id,
+                        agent_statuses,
+                        statuses,
+                        failure_reason: None,
+                    }
+                    .into(),
+                )
+                .await;
+            drop(team_lock);
+            let _ = remove_dir_if_exists(&team_dir_path).await;
+            return Err(collab_spawn_error(err));
+        }
+
+        if dispatch.background {
+            maybe_start_background_agent_cleanup(session.clone(), turn.clone(), dispatch.agent_id);
+        }
+    }
+    drop(team_lock);
 
     let agent_statuses = team_member_status_entries(&spawned_members, &statuses);
     session
@@ -372,6 +462,7 @@ pub async fn handle(
                 call_id: event_call_id,
                 agent_statuses,
                 statuses: statuses.clone(),
+                failure_reason: None,
             }
             .into(),
         )

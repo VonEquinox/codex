@@ -32,15 +32,20 @@ pub async fn handle(
 ) -> Result<ToolOutput, FunctionCallError> {
     let args: TeamCleanupArgs = parse_arguments(&arguments)?;
     let team_id = normalized_team_id(&args.team_id)?;
+    let _team_lock = lock_team(turn.config.codex_home.as_path(), &team_id).await?;
     let config =
         super::read_persisted_team_config(turn.config.codex_home.as_path(), &team_id).await?;
-    let caller_thread_id = session.conversation_id.to_string();
-    if caller_thread_id != config.lead_thread_id {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "team_cleanup must be run by the lead thread `{}`",
-            config.lead_thread_id
-        )));
-    }
+    assert_team_lead(&team_id, &config, session.conversation_id)?;
+    assert_team_state_allows_cleanup(&team_id, config.state)?;
+    write_json_atomic(
+        &team_config_path(turn.config.codex_home.as_path(), &team_id),
+        &PersistedTeamConfig {
+            state: PersistedTeamState::Cleaning,
+            ..config.clone()
+        },
+    )
+    .await
+    .map_err(|err| team_persistence_error("write team config", &team_id, err))?;
 
     let mut blocked = Vec::new();
     let mut closed = Vec::with_capacity(config.members.len());

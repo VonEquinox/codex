@@ -93,6 +93,7 @@ pub async fn handle(
                         call_id: call_id.clone(),
                         agent_statuses,
                         statuses,
+                        failure_reason: None,
                     }
                     .into(),
                 )
@@ -140,6 +141,7 @@ pub async fn handle(
                 call_id,
                 agent_statuses,
                 statuses: statuses_map,
+                failure_reason: None,
             }
             .into(),
         )

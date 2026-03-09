@@ -21,4 +21,8 @@ agent_statuses?: Array<CollabAgentStatusEntry>,
 /**
  * Last known status of the receiver agents reported to the sender agent.
  */
-statuses: { [key in ThreadId]?: AgentStatus }, };
+statuses: { [key in ThreadId]?: AgentStatus }, 
+/**
+ * Failure reason when the wait operation ended in a blocked or failed state.
+ */
+failure_reason: string | null, };

@@ -3595,6 +3595,8 @@ pub enum ThreadItem {
         prompt: Option<String>,
         /// Last known status of the target agents, when available.
         agents_states: HashMap<String, CollabAgentState>,
+        /// Error details for failed collab tool calls, when available.
+        error: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]

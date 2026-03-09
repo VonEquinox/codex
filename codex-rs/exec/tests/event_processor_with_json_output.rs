@@ -628,6 +628,7 @@ fn collab_wait_end_without_begin_synthesizes_failed_item() {
             call_id: "call-11".to_string(),
             agent_statuses: Vec::new(),
             statuses: statuses.clone(),
+            failure_reason: None,
         }),
     );
     let events = ep.collect_thread_events(&end);

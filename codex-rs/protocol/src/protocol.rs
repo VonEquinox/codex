@@ -1600,12 +1600,8 @@ pub struct TokenUsageInfo {
     // TODO(aibrahim): make this not optional
     #[ts(type = "number | null")]
     pub model_context_window: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     #[ts(type = "number | null")]
     pub model_full_context_window: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     #[ts(type = "number | null")]
     pub model_auto_compact_token_limit: Option<i64>,
 }
@@ -3132,6 +3128,9 @@ pub struct CollabWaitingEndEvent {
     pub agent_statuses: Vec<CollabAgentStatusEntry>,
     /// Last known status of the receiver agents reported to the sender agent.
     pub statuses: HashMap<ThreadId, AgentStatus>,
+    /// Failure reason when the wait operation ended in a blocked or failed state.
+    #[serde(default)]
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

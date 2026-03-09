@@ -55,6 +55,7 @@ pub async fn handle(
     let config =
         super::read_persisted_team_config(turn.config.codex_home.as_path(), &team_id).await?;
     super::assert_team_member_or_lead(&team_id, &config, session.conversation_id)?;
+    super::assert_team_state_allows_collaboration(&team_id, config.state, "team_inbox_pop")?;
 
     let limit = args
         .limit

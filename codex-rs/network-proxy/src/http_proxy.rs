@@ -982,7 +982,8 @@ mod tests {
     #[tokio::test]
     async fn http_connect_accept_blocks_in_limited_mode() {
         let policy = NetworkProxySettings {
-            allowed_domains: vec!["example.com".to_string()],
+            allowed_domains: vec!["example.invalid".to_string()],
+            allow_local_binding: true,
             ..Default::default()
         };
         let state = Arc::new(network_proxy_state_for_policy(policy));
@@ -990,8 +991,8 @@ mod tests {
 
         let mut req = Request::builder()
             .method(Method::CONNECT)
-            .uri("https://example.com:443")
-            .header("host", "example.com:443")
+            .uri("https://example.invalid:443")
+            .header("host", "example.invalid:443")
             .body(Body::empty())
             .unwrap();
         req.extensions_mut().insert(state);
@@ -1007,15 +1008,16 @@ mod tests {
     #[tokio::test]
     async fn http_connect_accept_allows_allowlisted_host_in_full_mode() {
         let policy = NetworkProxySettings {
-            allowed_domains: vec!["example.com".to_string()],
+            allowed_domains: vec!["example.invalid".to_string()],
+            allow_local_binding: true,
             ..Default::default()
         };
         let state = Arc::new(network_proxy_state_for_policy(policy));
 
         let mut req = Request::builder()
             .method(Method::CONNECT)
-            .uri("https://example.com:443")
-            .header("host", "example.com:443")
+            .uri("https://example.invalid:443")
+            .header("host", "example.invalid:443")
             .body(Body::empty())
             .unwrap();
         req.extensions_mut().insert(state);
