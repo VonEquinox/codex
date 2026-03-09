@@ -29,11 +29,6 @@ jobs:
             target: aarch64-apple-darwin
             binary_name: codex
             packaged_name: codex-aarch64-apple-darwin
-          - label: macos-x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
-            binary_name: codex
-            packaged_name: codex-x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v6
