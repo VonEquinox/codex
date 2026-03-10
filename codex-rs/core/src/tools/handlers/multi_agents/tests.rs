@@ -266,8 +266,30 @@ fn team_bootstrap_message_mentions_coordination_contract() {
     assert!(message.contains("`team_message`"));
     assert!(message.contains("`team_ask_lead`"));
     assert!(message.contains("`team_inbox_pop`"));
+    assert!(message.contains("Start with a short coordination pass: call `team_inbox_pop`"));
+    assert!(message.contains("Prefer explicit teammate communication"));
     assert!(message.contains("dedicated git worktree"));
     assert!(message.contains("`reviewer` [code-review]: Review risks"));
+}
+
+#[tokio::test]
+async fn apply_spawn_agent_overrides_keeps_collab_at_max_depth() {
+    let (_session, turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    let _ = config.features.enable(crate::features::Feature::Collab);
+    config.agent_max_depth = 1;
+
+    apply_spawn_agent_overrides(&mut config, 1);
+    assert_eq!(
+        config.features.enabled(crate::features::Feature::Collab),
+        true
+    );
+
+    apply_spawn_agent_overrides(&mut config, 2);
+    assert_eq!(
+        config.features.enabled(crate::features::Feature::Collab),
+        false
+    );
 }
 
 #[tokio::test]
@@ -3251,6 +3273,64 @@ async fn spawn_is_rejected_for_agent_team_teammates() {
         panic!("expected RespondToModel error");
     };
     assert!(message.contains("spawn_team is disabled for agent team teammates"));
+
+    remove_team_record(lead_thread_id, "team-1").expect("cleanup should succeed");
+}
+
+#[tokio::test]
+async fn generic_collab_tools_are_disabled_for_team_teammates() {
+    let (mut session, turn) = make_session_and_context().await;
+    let lead_thread_id = session.conversation_id;
+    let member_thread_id = ThreadId::new();
+    insert_team_record(
+        lead_thread_id,
+        "team-1".to_string(),
+        TeamRecord {
+            members: vec![TeamMember {
+                name: "worker".to_string(),
+                member_id: ThreadId::new().to_string(),
+                agent_id: member_thread_id,
+                agent_type: None,
+                model_provider: None,
+                model: None,
+                initial_task: "work".to_string(),
+                background: false,
+                worktree: false,
+            }],
+            created_at: 0,
+        },
+    )
+    .expect("insert team record should succeed");
+
+    session.conversation_id = member_thread_id;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    for (tool_name, payload) in [
+        (
+            "send_input",
+            json!({"id": lead_thread_id.to_string(), "message": "status?"}),
+        ),
+        ("wait", json!({"ids": [lead_thread_id.to_string()]})),
+        ("resume_agent", json!({"id": lead_thread_id.to_string()})),
+        ("close_agent", json!({"id": lead_thread_id.to_string()})),
+    ] {
+        let Err(err) = MultiAgentHandler
+            .handle(invocation(
+                session.clone(),
+                turn.clone(),
+                tool_name,
+                function_payload(payload),
+            ))
+            .await
+        else {
+            panic!("{tool_name} should fail for agent team teammates");
+        };
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected RespondToModel error");
+        };
+        assert!(message.contains(&format!("{tool_name} is disabled for agent team teammates")));
+    }
 
     remove_team_record(lead_thread_id, "team-1").expect("cleanup should succeed");
 }

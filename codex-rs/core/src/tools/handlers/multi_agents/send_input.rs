@@ -22,6 +22,13 @@ pub async fn handle(
     arguments: String,
 ) -> Result<ToolOutput, FunctionCallError> {
     let args: SendInputArgs = parse_arguments(&arguments)?;
+    super::reject_team_member_generic_collab_tool(
+        turn.config.codex_home.as_path(),
+        session.conversation_id,
+        "send_input",
+        "Use `team_message` for teammates and `team_ask_lead` for the lead instead.",
+    )
+    .await?;
     let receiver_thread_id = agent_id(&args.id)?;
     let input_items = parse_collab_input(args.message, args.items)?;
     let prompt = input_preview(&input_items);

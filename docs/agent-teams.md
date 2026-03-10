@@ -77,6 +77,10 @@ when the in-memory lease registry is empty.
 - Teammates should use `team_task_claim` / `team_task_claim_next` before starting unclaimed work,
   `team_task_complete` when their slice is done, `team_message` for peer handoffs, and
   `team_ask_lead` for blockers or scope changes.
+- Teammates are expected to coordinate proactively, not just reactively: review the roster at the
+  start, call `team_inbox_pop`, message adjacent teammates when assumptions or dependencies
+  overlap, and re-check
+  `team_inbox_pop` before waiting or handing work off.
 - After a restart, `resume_agent` re-injects the same bootstrap context so resumed teammates can
   continue with the same operating contract.
 

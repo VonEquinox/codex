@@ -20,6 +20,13 @@ pub async fn handle(
     arguments: String,
 ) -> Result<ToolOutput, FunctionCallError> {
     let args: ResumeAgentArgs = parse_arguments(&arguments)?;
+    super::reject_team_member_generic_collab_tool(
+        turn.config.codex_home.as_path(),
+        session.conversation_id,
+        "resume_agent",
+        "Ask the team lead to resume agents.",
+    )
+    .await?;
     let receiver_thread_id = agent_id(&args.id)?;
     let child_depth = next_thread_spawn_depth(&turn.session_source);
     if exceeds_thread_spawn_depth_limit(child_depth, turn.config.agent_max_depth) {

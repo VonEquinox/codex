@@ -26,6 +26,13 @@ pub async fn handle(
             "ids must be non-empty".to_owned(),
         ));
     }
+    super::reject_team_member_generic_collab_tool(
+        turn.config.codex_home.as_path(),
+        session.conversation_id,
+        "wait",
+        "Use the team-scoped tools and inbox flow instead of raw agent waits.",
+    )
+    .await?;
     let receiver_thread_ids = args
         .ids
         .iter()

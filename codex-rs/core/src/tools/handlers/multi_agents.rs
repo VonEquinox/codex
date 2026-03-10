@@ -1217,9 +1217,11 @@ Team roster:\n\
 Team operating rules:\n\
 - You are not the lead. Escalate scope changes, priority changes, or blockers with `team_ask_lead`.\n\
 - Own your assigned slice and avoid overlapping another teammate's work without coordination.\n\
+- Start with a short coordination pass: call `team_inbox_pop`, review the roster, identify adjacent teammates, and proactively send `team_message` when another member's work affects your assumptions, inputs, or handoff.\n\
 - Claim queued work with `team_task_claim_next` or `team_task_claim` before starting unclaimed tasks, then call `team_task_complete` when your slice is done.\n\
-- Use `team_message` for direct teammate coordination and handoffs.\n\
-- Check `team_inbox_pop` for queued messages and `team_inbox_ack` after processing them.\n\
+- Prefer explicit teammate communication over silent assumptions when work is coupled. Short, useful coordination is better than isolated guessing.\n\
+- Use `team_message` for direct teammate coordination, dependency checks, and handoffs. Reply promptly when another teammate reaches out.\n\
+- Check `team_inbox_pop` for queued messages and `team_inbox_ack` after processing them. Poll again before waiting, after major substeps, and before handoffs.\n\
 - Keep updates concise and decision-oriented: progress, artifacts, blockers, and next step.\n\
 - Do not spawn nested teams or unrelated agents unless the lead explicitly asks.\n\
 \n\
@@ -1386,6 +1388,21 @@ async fn find_team_for_member(
     }
 
     Ok(None)
+}
+
+async fn reject_team_member_generic_collab_tool(
+    codex_home: &Path,
+    sender_thread_id: ThreadId,
+    tool_name: &str,
+    guidance: &str,
+) -> Result<(), FunctionCallError> {
+    if let Some(team_id) = find_team_for_member(codex_home, sender_thread_id).await? {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{tool_name} is disabled for agent team teammates (team `{team_id}`). {guidance}"
+        )));
+    }
+
+    Ok(())
 }
 
 async fn find_persisted_team_member(
@@ -2113,6 +2130,13 @@ pub mod close_agent {
         arguments: String,
     ) -> Result<ToolOutput, FunctionCallError> {
         let args: CloseAgentArgs = parse_arguments(&arguments)?;
+        reject_team_member_generic_collab_tool(
+            turn.config.codex_home.as_path(),
+            session.conversation_id,
+            "close_agent",
+            "Ask the team lead to close agents.",
+        )
+        .await?;
         let agent_id = agent_id(&args.id)?;
         session
             .send_event(
@@ -2353,7 +2377,7 @@ fn apply_spawn_agent_runtime_overrides(
 }
 
 fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
-    if child_depth >= config.agent_max_depth {
+    if exceeds_thread_spawn_depth_limit(child_depth, config.agent_max_depth) {
         let _ = config.features.disable(Feature::Collab);
     }
 }
