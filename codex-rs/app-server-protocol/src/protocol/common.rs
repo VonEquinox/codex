@@ -171,6 +171,12 @@ macro_rules! client_request_definitions {
             Ok(())
         }
 
+        pub(crate) fn visit_client_response_types(v: &mut impl ::ts_rs::TypeVisitor) {
+            $(
+                v.visit::<$response>();
+            )*
+        }
+
         #[allow(clippy::vec_init_then_push)]
         pub fn export_client_response_schemas(
             out_dir: &::std::path::Path,
@@ -291,6 +297,10 @@ client_request_definitions! {
     PluginInstall => "plugin/install" {
         params: v2::PluginInstallParams,
         response: v2::PluginInstallResponse,
+    },
+    PluginUninstall => "plugin/uninstall" {
+        params: v2::PluginUninstallParams,
+        response: v2::PluginUninstallResponse,
     },
     TurnStart => "turn/start" {
         params: v2::TurnStartParams,
@@ -545,6 +555,12 @@ macro_rules! server_request_definitions {
             Ok(())
         }
 
+        pub(crate) fn visit_server_response_types(v: &mut impl ::ts_rs::TypeVisitor) {
+            $(
+                v.visit::<$response>();
+            )*
+        }
+
         #[allow(clippy::vec_init_then_push)]
         pub fn export_server_response_schemas(
             out_dir: &Path,
@@ -693,6 +709,12 @@ server_request_definitions! {
     McpServerElicitationRequest => "mcpServer/elicitation/request" {
         params: v2::McpServerElicitationRequestParams,
         response: v2::McpServerElicitationRequestResponse,
+    },
+
+    /// Request approval for additional permissions from the user.
+    PermissionsRequestApproval => "item/permissions/requestApproval" {
+        params: v2::PermissionsRequestApprovalParams,
+        response: v2::PermissionsRequestApprovalResponse,
     },
 
     /// Execute a dynamic tool call on the client.
