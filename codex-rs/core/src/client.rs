@@ -78,6 +78,7 @@ use http::HeaderValue;
 use http::Method;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
+use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -101,8 +102,6 @@ use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::WireApi;
 use crate::tools::spec::create_tools_json_for_responses_api;
-use codex_protocol::models::ContentItem;
-
 const REASONING_SUMMARY_TRANSLATION_INSTRUCTIONS: &str = "Translate the following reasoning summary into Chinese. Preserve markdown formatting, headings, and line breaks. Return only the translated text.";
 
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
@@ -148,11 +147,6 @@ struct CurrentClientSetup {
     auth: Option<CodexAuth>,
     api_provider: codex_api::Provider,
     api_auth: CoreAuthProvider,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct UnaryResponsesOutput {
-    output: Vec<ResponseItem>,
 }
 
 /// A session-scoped client for model-provider API calls.
@@ -500,6 +494,35 @@ impl ModelClientSession {
         model: &str,
         text: &str,
     ) -> Result<String> {
+        #[derive(Debug, Deserialize)]
+        struct ChatCompletionResponse {
+            choices: Vec<ChatCompletionChoice>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct ChatCompletionChoice {
+            message: ChatCompletionMessage,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct ChatCompletionMessage {
+            content: ChatCompletionContent,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(untagged)]
+        enum ChatCompletionContent {
+            Text(String),
+            Parts(Vec<ChatCompletionContentPart>),
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct ChatCompletionContentPart {
+            #[serde(rename = "type")]
+            kind: String,
+            text: Option<String>,
+        }
+
         if text.trim().is_empty() {
             return Ok(text.to_string());
         }
@@ -516,31 +539,23 @@ impl ModelClientSession {
 
         let api_provider = provider.to_api_provider(None)?;
         let api_auth = auth_provider_from_auth(None, provider)?;
-        let request_body = ResponsesApiRequest {
-            model: model.to_string(),
-            instructions: REASONING_SUMMARY_TRANSLATION_INSTRUCTIONS.to_string(),
-            input: vec![ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: text.to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            }],
-            tools: Vec::new(),
-            tool_choice: "none".to_string(),
-            parallel_tool_calls: false,
-            reasoning: None,
-            store: false,
-            stream: false,
-            include: Vec::new(),
-            service_tier: None,
-            prompt_cache_key: None,
-            text: None,
-        };
+        let request_body = serde_json::json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": REASONING_SUMMARY_TRANSLATION_INSTRUCTIONS,
+                },
+                {
+                    "role": "user",
+                    "content": text,
+                },
+            ],
+            "temperature": 0,
+            "stream": false,
+        });
 
-        let mut request = api_provider.build_request(Method::POST, "responses");
+        let mut request = api_provider.build_request(Method::POST, "chat/completions");
         request.timeout = Some(Duration::from_secs(30));
         request.headers.insert(
             http::header::CONTENT_TYPE,
@@ -569,38 +584,27 @@ impl ModelClientSession {
         .await
         .map_err(|err| map_api_error(ApiError::Transport(err)))?;
 
-        let parsed: UnaryResponsesOutput =
+        let parsed: ChatCompletionResponse =
             serde_json::from_slice(&response.body).map_err(|err| {
                 CodexErr::Stream(format!("failed to parse translation response: {err}"), None)
             })?;
+
         let translated = parsed
-            .output
+            .choices
             .into_iter()
-            .filter_map(|item| match item {
-                ResponseItem::Message { role, content, .. } if role == "assistant" => Some(
-                    content
-                        .into_iter()
-                        .filter_map(|entry| match entry {
-                            ContentItem::OutputText { text } => Some(text),
-                            ContentItem::InputText { .. } | ContentItem::InputImage { .. } => None,
-                        })
-                        .collect::<String>(),
-                ),
-                ResponseItem::Message { .. }
-                | ResponseItem::Reasoning { .. }
-                | ResponseItem::LocalShellCall { .. }
-                | ResponseItem::FunctionCall { .. }
-                | ResponseItem::FunctionCallOutput { .. }
-                | ResponseItem::CustomToolCall { .. }
-                | ResponseItem::CustomToolCallOutput { .. }
-                | ResponseItem::WebSearchCall { .. }
-                | ResponseItem::ImageGenerationCall { .. }
-                | ResponseItem::GhostSnapshot { .. }
-                | ResponseItem::Compaction { .. }
-                | ResponseItem::Other => None,
+            .next()
+            .map(|choice| match choice.message.content {
+                ChatCompletionContent::Text(text) => text,
+                ChatCompletionContent::Parts(parts) => parts
+                    .into_iter()
+                    .filter_map(|part| if part.kind == "text" { part.text } else { None })
+                    .collect::<String>(),
             })
-            .collect::<String>();
-        if translated.is_empty() {
+            .unwrap_or_default();
+
+        if translated.trim().is_empty() {
+            Ok(text.to_string())
+        } else if text.contains("**") && !translated.contains("**") {
             Ok(text.to_string())
         } else {
             Ok(translated)

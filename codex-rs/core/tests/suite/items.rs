@@ -1113,21 +1113,21 @@ async fn reasoning_summary_translation_keeps_canonical_items_raw_and_translates_
     let server = start_mock_server().await;
     let translation_server = start_mock_server().await;
     Mock::given(method("POST"))
-        .and(path("/v1/responses"))
+        .and(path("/v1/chat/completions"))
         .and(header("authorization", "Bearer translator-inline-key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "output": [
+            "choices": [
                 {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": "第一步"
-                        }
-                    ]
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "第一步"
+                    },
+                    "finish_reason": "stop"
                 }
-            ]
+            ],
+            "model": "translator-model",
+            "object": "chat.completion"
         })))
         .expect(1)
         .mount(&translation_server)
@@ -1194,11 +1194,11 @@ async fn reasoning_summary_translation_keeps_canonical_items_raw_and_translates_
     assert_eq!(requests.len(), 1);
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body)?;
     assert_eq!(body["model"], "translator-model");
-    assert_eq!(body["input"][0]["content"][0]["text"], "step one");
     assert_eq!(
-        body["instructions"],
+        body["messages"][0]["content"],
         "Translate the following reasoning summary into Chinese. Preserve markdown formatting, headings, and line breaks. Return only the translated text."
     );
+    assert_eq!(body["messages"][1]["content"], "step one");
 
     Ok(())
 }
@@ -1211,7 +1211,7 @@ async fn reasoning_summary_translation_falls_back_to_original_text_on_failure() 
     let server = start_mock_server().await;
     let translation_server = start_mock_server().await;
     Mock::given(method("POST"))
-        .and(path("/v1/responses"))
+        .and(path("/v1/chat/completions"))
         .and(header("authorization", "Bearer translator-inline-key"))
         .respond_with(ResponseTemplate::new(500))
         .expect(1)
@@ -1283,20 +1283,20 @@ async fn reasoning_summary_translation_does_not_fallback_to_session_auth_without
     let server = start_mock_server().await;
     let translation_server = start_mock_server().await;
     Mock::given(method("POST"))
-        .and(path("/v1/responses"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "output": [
+            "choices": [
                 {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": "第一步"
-                        }
-                    ]
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "第一步"
+                    },
+                    "finish_reason": "stop"
                 }
-            ]
+            ],
+            "model": "translator-model",
+            "object": "chat.completion"
         })))
         .expect(0)
         .mount(&translation_server)

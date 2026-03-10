@@ -30,6 +30,8 @@ When Codex knows which client started the turn, the legacy notify JSON payload a
 
 Codex can translate the live reasoning-summary display into Chinese when the experimental feature is enabled and a translation provider is configured.
 
+The translation request uses the Chat Completions endpoint (`/v1/chat/completions`) on the configured translation provider (not `/v1/responses`), so the provider must support that route.
+
 ```toml
 [features]
 reasoning_summary_translation = true
