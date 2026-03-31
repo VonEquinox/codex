@@ -5989,6 +5989,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn slash_popup_btw_for_bt_ui() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+
+        type_chars_humanlike(&mut composer, &['/', 'b', 't']);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 5)).expect("terminal");
+        terminal
+            .draw(|f| composer.render(f.area(), f.buffer_mut()))
+            .expect("draw composer");
+
+        insta::assert_snapshot!("slash_popup_bt", terminal.backend());
+    }
+
     fn flush_after_paste_burst(composer: &mut ChatComposer) -> bool {
         std::thread::sleep(PasteBurst::recommended_active_flush_delay());
         composer.flush_paste_burst_if_due()
@@ -6439,6 +6465,39 @@ mod tests {
                 );
             }
             _ => panic!("expected CommandWithArgs for /plan with args"),
+        }
+    }
+
+    #[test]
+    fn slash_btw_with_args_dispatches_command_with_args() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+
+        composer
+            .textarea
+            .set_text_clearing_elements("/btw explain the last warning");
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match result {
+            InputResult::CommandWithArgs(cmd, args, text_elements) => {
+                assert_eq!(cmd.command(), "btw");
+                assert_eq!(args, "explain the last warning");
+                assert!(text_elements.is_empty());
+            }
+            other => panic!("expected CommandWithArgs for /btw, got {other:?}"),
         }
     }
 

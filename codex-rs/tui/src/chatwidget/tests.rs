@@ -6922,6 +6922,46 @@ async fn plan_slash_command_with_args_submits_prompt_in_plan_mode() {
 }
 
 #[tokio::test]
+async fn btw_slash_command_with_args_emits_background_request_while_task_running() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.bottom_pane.set_task_running(/*running*/ true);
+
+    chat.bottom_pane.set_composer_text(
+        "/btw explain the last failure".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let pending = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+        other => panic!("expected pending /btw history cell, got {other:?}"),
+    };
+    let rendered = lines_to_single_string(&pending.display_lines(/*width*/ 80));
+    assert!(rendered.contains("/btw explain the last failure"));
+    assert!(rendered.contains("Answering in background"));
+
+    match rx.try_recv() {
+        Ok(AppEvent::RunBtw { request }) => {
+            assert_eq!(request.source_thread_id, thread_id);
+            assert_eq!(request.question, "explain the last failure");
+            assert_eq!(
+                request.items,
+                vec![UserInput::Text {
+                    text: "explain the last failure".to_string(),
+                    text_elements: Vec::new(),
+                }]
+            );
+        }
+        other => panic!("expected RunBtw event, got {other:?}"),
+    }
+
+    assert!(op_rx.try_recv().is_err(), "expected no direct op for /btw");
+}
+
+#[tokio::test]
 async fn collaboration_modes_defaults_to_code_on_startup() {
     let codex_home = tempdir().expect("tempdir");
     let cfg = ConfigBuilder::default()

@@ -30,6 +30,7 @@ pub enum SlashCommand {
     Init,
     Compact,
     Plan,
+    Btw,
     Collab,
     Agent,
     // Undo,
@@ -100,6 +101,9 @@ impl SlashCommand {
             SlashCommand::Realtime => "toggle realtime voice mode (experimental)",
             SlashCommand::Settings => "configure realtime microphone/speaker",
             SlashCommand::Plan => "switch to Plan mode",
+            SlashCommand::Btw => {
+                "ask a quick side question without interrupting the main conversation"
+            }
             SlashCommand::Collab => "change collaboration mode (experimental)",
             SlashCommand::Agent | SlashCommand::MultiAgents => "switch the active agent thread",
             SlashCommand::Approvals => "choose what Codex is allowed to do",
@@ -131,6 +135,7 @@ impl SlashCommand {
             SlashCommand::Review
                 | SlashCommand::Rename
                 | SlashCommand::Plan
+                | SlashCommand::Btw
                 | SlashCommand::Fast
                 | SlashCommand::SandboxReadRoot
         )
@@ -171,6 +176,7 @@ impl SlashCommand {
             | SlashCommand::Mcp
             | SlashCommand::Apps
             | SlashCommand::Plugins
+            | SlashCommand::Btw
             | SlashCommand::Feedback
             | SlashCommand::Quit
             | SlashCommand::Exit => true,
@@ -219,5 +225,11 @@ mod tests {
     #[test]
     fn clean_alias_parses_to_stop_command() {
         assert_eq!(SlashCommand::from_str("clean"), Ok(SlashCommand::Stop));
+    }
+
+    #[test]
+    fn btw_command_supports_inline_args_and_running_tasks() {
+        assert!(SlashCommand::Btw.supports_inline_args());
+        assert!(SlashCommand::Btw.available_during_task());
     }
 }

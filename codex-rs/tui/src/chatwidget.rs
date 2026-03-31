@@ -50,6 +50,8 @@ use crate::bottom_pane::StatusLinePreviewData;
 use crate::bottom_pane::StatusLineSetupView;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::bottom_pane::TerminalTitleSetupView;
+use crate::btw::BtwHistoryCell;
+use crate::btw::BtwRequest;
 use crate::mention_codec::LinkedMention;
 use crate::mention_codec::encode_history_mentions;
 use crate::model_catalog::ModelCatalog;
@@ -245,6 +247,7 @@ const MULTI_AGENT_ENABLE_NOTICE: &str = "Subagents will be enabled in the next s
 const PLAN_MODE_REASONING_SCOPE_TITLE: &str = "Apply reasoning change";
 const PLAN_MODE_REASONING_SCOPE_PLAN_ONLY: &str = "Apply to Plan mode override";
 const PLAN_MODE_REASONING_SCOPE_ALL_MODES: &str = "Apply to global default and Plan mode override";
+const BTW_USAGE_MESSAGE: &str = "Usage: /btw <question>";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
 const TUI_STUB_MESSAGE: &str = "Not available in TUI yet.";
 
@@ -5008,6 +5011,9 @@ impl ChatWidget {
                     );
                 }
             }
+            SlashCommand::Btw => {
+                self.add_info_message(BTW_USAGE_MESSAGE.to_string(), /*hint*/ None);
+            }
             SlashCommand::Collab => {
                 if !self.collaboration_modes_enabled() {
                     self.add_info_message(
@@ -5331,6 +5337,67 @@ impl ChatWidget {
                     self.queue_user_message(user_message);
                 }
             }
+            SlashCommand::Btw if !trimmed.is_empty() => {
+                let Some(source_thread_id) = self.thread_id else {
+                    self.add_error_message(
+                        "A thread must contain at least one turn before /btw can use current context."
+                            .to_string(),
+                    );
+                    return;
+                };
+                let Some((prepared_args, prepared_elements)) = self
+                    .bottom_pane
+                    .prepare_inline_args_submission(/*record_history*/ false)
+                else {
+                    return;
+                };
+                let local_images = self
+                    .bottom_pane
+                    .take_recent_submission_images_with_placeholders();
+                let remote_image_urls = self.take_remote_image_urls();
+                let mention_bindings = self.bottom_pane.take_recent_submission_mention_bindings();
+                if prepared_args.is_empty()
+                    && local_images.is_empty()
+                    && remote_image_urls.is_empty()
+                {
+                    self.add_error_message(BTW_USAGE_MESSAGE.to_string());
+                    return;
+                }
+                if (!local_images.is_empty() || !remote_image_urls.is_empty())
+                    && !self.current_model_supports_images()
+                {
+                    self.restore_blocked_image_submission(
+                        prepared_args,
+                        prepared_elements,
+                        local_images,
+                        mention_bindings,
+                        remote_image_urls,
+                    );
+                    return;
+                }
+                let items = self.build_user_input_items(
+                    &prepared_args,
+                    &prepared_elements,
+                    &local_images,
+                    &remote_image_urls,
+                    &mention_bindings,
+                );
+                self.add_to_history(BtwHistoryCell::pending(
+                    prepared_args.clone(),
+                    self.config.cwd.to_path_buf(),
+                ));
+                self.request_redraw();
+                self.app_event_tx.send(AppEvent::RunBtw {
+                    request: BtwRequest {
+                        source_thread_id,
+                        question: prepared_args,
+                        items,
+                        cwd: self.config.cwd.to_path_buf(),
+                        approvals_reviewer: self.config.approvals_reviewer,
+                    },
+                });
+                self.bottom_pane.drain_pending_submission_state();
+            }
             SlashCommand::Review if !trimmed.is_empty() => {
                 let Some((prepared_args, _prepared_elements)) = self
                     .bottom_pane
@@ -5454,75 +5521,31 @@ impl ChatWidget {
         }
     }
 
-    fn submit_user_message(&mut self, user_message: UserMessage) {
-        if !self.is_session_configured() {
-            tracing::warn!("cannot submit user message before session is configured; queueing");
-            self.queued_user_messages.push_front(user_message);
-            self.refresh_pending_input_preview();
-            return;
-        }
-        let UserMessage {
-            text,
-            local_images,
-            remote_image_urls,
-            text_elements,
-            mention_bindings,
-        } = user_message;
-        if text.is_empty() && local_images.is_empty() && remote_image_urls.is_empty() {
-            return;
-        }
-        if (!local_images.is_empty() || !remote_image_urls.is_empty())
-            && !self.current_model_supports_images()
-        {
-            self.restore_blocked_image_submission(
-                text,
-                text_elements,
-                local_images,
-                mention_bindings,
-                remote_image_urls,
-            );
-            return;
-        }
-
-        let render_in_history = !self.agent_turn_running;
-        let mut items: Vec<UserInput> = Vec::new();
-
-        // Special-case: "!cmd" executes a local shell command instead of sending to the model.
-        if let Some(stripped) = text.strip_prefix('!') {
-            let cmd = stripped.trim();
-            if cmd.is_empty() {
-                self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
-                    history_cell::new_info_event(
-                        USER_SHELL_COMMAND_HELP_TITLE.to_string(),
-                        Some(USER_SHELL_COMMAND_HELP_HINT.to_string()),
-                    ),
-                )));
-                return;
-            }
-            self.submit_op(AppCommand::run_user_shell_command(cmd.to_string()));
-            return;
-        }
-
-        for image_url in &remote_image_urls {
-            items.push(UserInput::Image {
-                image_url: image_url.clone(),
-            });
-        }
-
-        for image in &local_images {
-            items.push(UserInput::LocalImage {
-                path: image.path.clone(),
-            });
-        }
+    fn build_user_input_items(
+        &self,
+        text: &str,
+        text_elements: &[TextElement],
+        local_images: &[LocalImageAttachment],
+        remote_image_urls: &[String],
+        mention_bindings: &[MentionBinding],
+    ) -> Vec<UserInput> {
+        let mut items: Vec<UserInput> = remote_image_urls
+            .iter()
+            .cloned()
+            .map(|image_url| UserInput::Image { image_url })
+            .collect();
+        items.extend(local_images.iter().map(|image| UserInput::LocalImage {
+            path: image.path.clone(),
+        }));
 
         if !text.is_empty() {
             items.push(UserInput::Text {
-                text: text.clone(),
-                text_elements: text_elements.clone(),
+                text: text.to_string(),
+                text_elements: text_elements.to_vec(),
             });
         }
 
-        let mentions = collect_tool_mentions(&text, &HashMap::new());
+        let mentions = collect_tool_mentions(text, &HashMap::new());
         let bound_names: HashSet<String> = mention_bindings
             .iter()
             .map(|binding| binding.mention.clone())
@@ -5537,7 +5560,7 @@ impl ChatWidget {
                 .map(|skill| skill.name.to_ascii_lowercase())
                 .collect();
 
-            for binding in &mention_bindings {
+            for binding in mention_bindings {
                 let path = binding
                     .path
                     .strip_prefix("skill://")
@@ -5570,7 +5593,7 @@ impl ChatWidget {
         }
 
         if let Some(plugins) = self.plugins_for_mentions() {
-            for binding in &mention_bindings {
+            for binding in mention_bindings {
                 let Some(plugin_config_name) = binding
                     .path
                     .strip_prefix("plugin://")
@@ -5595,7 +5618,7 @@ impl ChatWidget {
 
         let mut selected_app_ids: HashSet<String> = HashSet::new();
         if let Some(apps) = self.connectors_for_mentions() {
-            for binding in &mention_bindings {
+            for binding in mention_bindings {
                 let Some(app_id) = binding
                     .path
                     .strip_prefix("app://")
@@ -5627,6 +5650,65 @@ impl ChatWidget {
                 });
             }
         }
+
+        items
+    }
+
+    fn submit_user_message(&mut self, user_message: UserMessage) {
+        if !self.is_session_configured() {
+            tracing::warn!("cannot submit user message before session is configured; queueing");
+            self.queued_user_messages.push_front(user_message);
+            self.refresh_pending_input_preview();
+            return;
+        }
+        let UserMessage {
+            text,
+            local_images,
+            remote_image_urls,
+            text_elements,
+            mention_bindings,
+        } = user_message;
+        if text.is_empty() && local_images.is_empty() && remote_image_urls.is_empty() {
+            return;
+        }
+        if (!local_images.is_empty() || !remote_image_urls.is_empty())
+            && !self.current_model_supports_images()
+        {
+            self.restore_blocked_image_submission(
+                text,
+                text_elements,
+                local_images,
+                mention_bindings,
+                remote_image_urls,
+            );
+            return;
+        }
+
+        let render_in_history = !self.agent_turn_running;
+
+        // Special-case: "!cmd" executes a local shell command instead of sending to the model.
+        if let Some(stripped) = text.strip_prefix('!') {
+            let cmd = stripped.trim();
+            if cmd.is_empty() {
+                self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    history_cell::new_info_event(
+                        USER_SHELL_COMMAND_HELP_TITLE.to_string(),
+                        Some(USER_SHELL_COMMAND_HELP_HINT.to_string()),
+                    ),
+                )));
+                return;
+            }
+            self.submit_op(AppCommand::run_user_shell_command(cmd.to_string()));
+            return;
+        }
+
+        let items = self.build_user_input_items(
+            &text,
+            &text_elements,
+            &local_images,
+            &remote_image_urls,
+            &mention_bindings,
+        );
 
         let effective_mode = self.effective_collaboration_mode();
         if effective_mode.model().trim().is_empty() {

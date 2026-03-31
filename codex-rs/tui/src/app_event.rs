@@ -29,6 +29,7 @@ use codex_utils_approval_presets::ApprovalPreset;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
+use crate::btw::BtwRequest;
 use crate::history_cell::HistoryCell;
 
 use codex_core::config::types::ApprovalsReviewer;
@@ -255,6 +256,25 @@ pub(crate) enum AppEvent {
     /// Result of fetching MCP inventory via app-server RPCs.
     McpInventoryLoaded {
         result: Result<Vec<McpServerStatus>, String>,
+    },
+
+    /// Run a quick side question on a forked background thread.
+    RunBtw {
+        request: BtwRequest,
+    },
+
+    /// Result of a completed `/btw` side question.
+    BtwCompleted {
+        question: String,
+        answer: String,
+        cwd: PathBuf,
+    },
+
+    /// Failure from a `/btw` side question.
+    BtwFailed {
+        question: String,
+        error: String,
+        cwd: PathBuf,
     },
 
     InsertHistoryCell(Box<dyn HistoryCell>),

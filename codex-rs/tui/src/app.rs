@@ -16,6 +16,7 @@ use crate::bottom_pane::McpServerElicitationFormRequest;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
+use crate::btw;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::ReplayKind;
@@ -4051,6 +4052,47 @@ impl App {
             }
             AppEvent::McpInventoryLoaded { result } => {
                 self.handle_mcp_inventory_result(result);
+            }
+            AppEvent::RunBtw { request } => {
+                let request_handle = app_server.request_handle();
+                let app_event_tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    let question = request.question.clone();
+                    let cwd = request.cwd.clone();
+                    let result = btw::run_btw(request_handle, request).await;
+                    match result {
+                        Ok(answer) => {
+                            app_event_tx.send(AppEvent::BtwCompleted {
+                                question,
+                                answer,
+                                cwd,
+                            });
+                        }
+                        Err(err) => {
+                            app_event_tx.send(AppEvent::BtwFailed {
+                                question,
+                                error: err.to_string(),
+                                cwd,
+                            });
+                        }
+                    }
+                });
+            }
+            AppEvent::BtwCompleted {
+                question,
+                answer,
+                cwd,
+            } => {
+                self.chat_widget
+                    .add_to_history(btw::BtwHistoryCell::completed(question, answer, cwd));
+            }
+            AppEvent::BtwFailed {
+                question,
+                error,
+                cwd,
+            } => {
+                self.chat_widget
+                    .add_to_history(btw::BtwHistoryCell::failed(question, error, cwd));
             }
             AppEvent::StartFileSearch(query) => {
                 self.file_search.on_user_query(query);

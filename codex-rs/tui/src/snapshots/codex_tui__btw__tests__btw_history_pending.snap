@@ -1,0 +1,6 @@
+---
+source: tui/src/btw.rs
+expression: lines_to_string(&cell)
+---
+/btw why did the last change work?
+↳ Answering in background…
